@@ -69,6 +69,7 @@ def remove_hard_subtitles(
     info: ft.MediaInfo,
     style: str,
     region: Optional[ft.Region] = None,
+    regions: Optional[Iterable[ft.Region]] = None,
     height_ratio: Optional[float] = None,
     crf: int = 23,
     preset: str = "medium",
@@ -77,8 +78,35 @@ def remove_hard_subtitles(
     on_progress: Optional[Callable[[float, float], None]] = None,
     on_log: Optional[Callable[[str], None]] = None,
     cancel: Optional[threading.Event] = None,
+    model_path: Optional[str] = None,
+    device: str = "auto",
 ) -> ft.RunResult:
-    """去除画面内烧录字幕（裁切 / 模糊 / delogo），需要重新编码视频。"""
+    """去除画面内烧录字幕 / 水印。
+
+    - crop_* / blur / delogo：拼 ffmpeg 命令一次跑完；
+    - inpaint：交给 inpaint.py 逐帧重绘（需要 onnxruntime + LaMa 模型）。
+    """
+    if style == ft.INPAINT_STYLE:
+        from . import inpaint as ip  # 延迟导入：不装 onnxruntime 也能用其他功能
+
+        targets = [r for r in (list(regions or []) + ([region] if region else [])) if r]
+        if not targets:
+            raise ValueError("AI 修复需要先框选文字区域")
+        return ip.process_video(
+            src,
+            dst,
+            info,
+            targets,
+            crf=crf,
+            preset=preset,
+            encoder=encoder,
+            on_progress=on_progress,
+            on_log=on_log,
+            cancel=cancel,
+            model_path=model_path,
+            device=device,
+        )
+
     cmd = ft.build_hard_remove_command(
         src,
         dst,

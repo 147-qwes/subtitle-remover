@@ -34,8 +34,10 @@ STYLE_LABELS: Dict[str, str] = {
     "裁切顶部（切掉顶部字幕条）": "crop_top",
     "模糊遮罩（画面尺寸不变）": "blur",
     "delogo 修复（按周围像素插值）": "delogo",
+    "AI 修复（重绘文字区域，不留遮挡）": "inpaint",
 }
 STYLE_KEYS = list(STYLE_LABELS.keys())
+STYLE_BY_KEY = {value: label for label, value in STYLE_LABELS.items()}
 
 # (按钮文案, y 比例, 宽比例, 高比例)
 PRESETS = [
