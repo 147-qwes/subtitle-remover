@@ -12,7 +12,7 @@ from tkinter import ttk
 from typing import Dict, List
 
 from . import remover
-from .constants import PRESETS, STYLE_KEYS
+from .constants import DEVICE_KEYS, PRESETS, STYLE_KEYS
 from .dnd import AVAILABLE as DND_AVAILABLE
 from .dnd import DND_FILES
 
@@ -258,6 +258,28 @@ class UiMixin:
         ).pack(side="left", padx=(12, 0))
         self.encoder_widgets = [self.encoder_combo, self.preset_combo, self.crf_spin]
 
+        # AI 推理设备（只有 AI 修复用得到）
+        ttk.Label(self.hard_frame, text="AI 推理设备").grid(
+            row=3, column=0, sticky="w", pady=(8, 0)
+        )
+        device_row = ttk.Frame(self.hard_frame)
+        device_row.grid(row=3, column=1, columnspan=5, sticky="w", pady=(8, 0))
+        self.device_var = tk.StringVar(value=DEVICE_KEYS[0])
+        self.device_combo = ttk.Combobox(
+            device_row,
+            textvariable=self.device_var,
+            values=DEVICE_KEYS,
+            state="readonly",
+            width=22,
+        )
+        self.device_combo.pack(side="left")
+        ttk.Label(
+            device_row,
+            text="显卡后端不可用时会自动降级到 CPU，不会中断任务",
+            foreground="#6b7480",
+        ).pack(side="left", padx=(12, 0))
+        self.device_widgets = [self.device_combo]
+
         # 输出
         out_frame = ttk.LabelFrame(main, text="输出", padding=10)
         out_frame.grid(row=4, column=0, sticky="ew", pady=6)
@@ -331,4 +353,5 @@ class UiMixin:
             [self.style_combo, self.ratio_spin]
             + self.region_widgets
             + self.encoder_widgets
+            + self.device_widgets
         )
