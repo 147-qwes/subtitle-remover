@@ -1,0 +1,5 @@
+# AI 修复依赖（CPU 版）
+#   pip install -r requirements-inpaint.txt
+# 想用显卡加速再装：pip install -r requirements-inpaint-gpu.txt
+onnxruntime>=1.16
+numpy>=1.24

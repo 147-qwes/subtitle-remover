@@ -2,6 +2,10 @@
 bin/
 tools/ffmpeg.zip
 
+# AI 修复模型（约 200MB，用 tools/download_model.py 下载）
+models/
+*.onnx
+
 # Python
 __pycache__/
 *.py[cod]

@@ -1,0 +1,14 @@
+# AI 修复的 GPU 加速依赖（NVIDIA 显卡，Windows / Linux）
+# 用法：
+#   pip install -r requirements-inpaint.txt
+#   pip install -r requirements-inpaint-gpu.txt
+#
+# onnxruntime-gpu 1.22 对应 CUDA 12.x + cuDNN 9。下面这些 nvidia-* 包会把
+# 运行库 DLL 装到 site-packages/nvidia/*/bin，程序启动时会自动把它们挂到 DLL 搜索路径，
+# 所以不需要单独安装 CUDA Toolkit。
+onnxruntime-gpu==1.22.0
+nvidia-cublas-cu12
+nvidia-cudnn-cu12
+nvidia-cufft-cu12
+nvidia-cuda-runtime-cu12
+nvidia-curand-cu12
