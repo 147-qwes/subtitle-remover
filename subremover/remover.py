@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 import threading
-from typing import Callable, Iterable, Optional
+from typing import Callable, Iterable, List, Optional
 
 from . import ffmpeg_tools as ft
 
@@ -80,6 +80,7 @@ def remove_hard_subtitles(
     cancel: Optional[threading.Event] = None,
     model_path: Optional[str] = None,
     device: str = "auto",
+    workers: int = 0,
 ) -> ft.RunResult:
     """去除画面内烧录字幕 / 水印。
 
@@ -89,7 +90,20 @@ def remove_hard_subtitles(
     if style == ft.INPAINT_STYLE:
         from . import inpaint as ip  # 延迟导入：不装 onnxruntime 也能用其他功能
 
-        targets = [r for r in (list(regions or []) + ([region] if region else [])) if r]
+        # region 与 regions 可能同时传入（GUI / CLI 都会这样），同一块区域只修一次
+        targets: List[ft.Region] = []
+        for item in list(regions or []) + ([region] if region else []):
+            if item is None:
+                continue
+            if any(
+                abs(item.x - seen.x) < 2
+                and abs(item.y - seen.y) < 2
+                and abs(item.w - seen.w) < 2
+                and abs(item.h - seen.h) < 2
+                for seen in targets
+            ):
+                continue
+            targets.append(item)
         if not targets:
             raise ValueError("AI 修复需要先框选文字区域")
         return ip.process_video(
@@ -105,6 +119,7 @@ def remove_hard_subtitles(
             cancel=cancel,
             model_path=model_path,
             device=device,
+            workers=workers,
         )
 
     cmd = ft.build_hard_remove_command(
