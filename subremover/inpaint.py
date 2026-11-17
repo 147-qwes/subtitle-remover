@@ -13,11 +13,13 @@
 from __future__ import annotations
 
 import os
+import queue
 import subprocess
 import sys
 import threading
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, List, Optional, Sequence, Tuple
 
 from . import ffmpeg_tools as ft
@@ -34,6 +36,11 @@ NET_SIZE = 512
 
 ALIGN = 8
 FEATHER_PX = 3
+
+# 长视频默认开两路并行推理（200 帧实测 1.15 → 1.48 帧/秒）；短于这个帧数
+# 要多加载一次模型，反而变慢
+PARALLEL_WORKERS = 2
+PARALLEL_MIN_FRAMES = 100
 
 
 class InpaintUnavailable(RuntimeError):
@@ -315,6 +322,26 @@ def resize_bilinear(image, out_h: int, out_w: int):
 # --------------------------------------------------------------------------- #
 # 模型推理
 # --------------------------------------------------------------------------- #
+def provider_candidates(device: str, available: Sequence[str]) -> List[List[str]]:
+    """按优先级给出候选 provider 组合，最后一组永远是纯 CPU。
+
+    CUDA 的 DLL 缺失、驱动过旧、显卡不支持都会让会话创建失败；这种情况下
+    逐个候选往后退，最后退到 CPU，整批任务不会因为显卡问题直接失败。
+    """
+    cpu = ["CPUExecutionProvider"]
+    gpu = [n for n in ("CUDAExecutionProvider", "DmlExecutionProvider") if n in available]
+
+    if device == "cpu" or not gpu:
+        return [cpu]
+    if device in ("cuda", "gpu"):
+        cuda = [n for n in ("CUDAExecutionProvider",) if n in available]
+        if not cuda:
+            return [cpu]
+        return [cuda + cpu, cpu]
+    # auto：先试所有可用 GPU 后端，再退 CPU
+    return [gpu + cpu, cpu]
+
+
 class LamaInpainter:
     """LaMa 局部重绘。只对区域小块推理，速度远快于整帧。"""
 
@@ -327,43 +354,62 @@ class LamaInpainter:
         self._np = _load_numpy()
         ort = _load_ort()
         self.model_path = model_path or require_model()
-
-        options = ort.SessionOptions()
-        options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        try:
-            cpu_count = os.cpu_count() or 4
-            options.intra_op_num_threads = threads or max(1, min(8, cpu_count))
-        except Exception:
-            pass
+        self.requested_device = device
 
         if device != "cpu":
             _prepare_cuda_dlls()
 
         started = time.time()
         available = list(ort.get_available_providers())
-        if device == "cpu":
-            providers = ["CPUExecutionProvider"]
-        elif device in ("cuda", "gpu"):
-            providers = ["CUDAExecutionProvider"]
-        else:  # auto：有 GPU 就用 GPU，失败再降级
-            providers = [
-                name
-                for name in ("CUDAExecutionProvider", "DmlExecutionProvider")
-                if name in available
-            ]
-        if "CPUExecutionProvider" not in providers:
-            providers.append("CPUExecutionProvider")
-        providers = [p for p in providers if p in available] or ["CPUExecutionProvider"]
+        self.fallback_note = ""
+        self.session = None
+        self.providers: List[str] = []
+        last_error: Optional[Exception] = None
 
-        self.session = ort.InferenceSession(
-            self.model_path, sess_options=options, providers=providers
-        )
-        self.providers = list(self.session.get_providers())
+        candidates = provider_candidates(device, available)
+        for index, providers in enumerate(candidates):
+            options = ort.SessionOptions()
+            options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+            try:
+                cpu_count = os.cpu_count() or 4
+                options.intra_op_num_threads = threads or max(1, min(8, cpu_count))
+            except Exception:
+                pass
+            try:
+                self.session = ort.InferenceSession(
+                    self.model_path, sess_options=options, providers=providers
+                )
+            except Exception as exc:  # 后端不可用时降级
+                last_error = exc
+                continue
+            self.providers = list(self.session.get_providers())
+            if index > 0 and candidates[0] != providers:
+                reason = str(last_error).strip().replace("\n", " ") if last_error else ""
+                if len(reason) > 160:
+                    reason = reason[:160] + "…"
+                self.fallback_note = (
+                    "显卡后端不可用，已自动改用 CPU 推理（速度会慢很多）"
+                    + (f"：{reason}" if reason else "")
+                )
+            break
+
+        if self.session is None:
+            raise RuntimeError(f"推理会话创建失败：{last_error}")
+
         inputs = self.session.get_inputs()
         self._image_input = inputs[0].name
         self._mask_input = inputs[1].name if len(inputs) > 1 else "mask"
         self._output = self.session.get_outputs()[0].name
         self.load_seconds = time.time() - started
+
+    def clone(self) -> "LamaInpainter":
+        """再建一个独立会话，供多路并行推理使用（一个会话只给一个线程用）。"""
+        if self.requested_device == "cpu" or self.providers == ["CPUExecutionProvider"]:
+            device = "cpu"
+        else:
+            device = self.requested_device
+        other = LamaInpainter(model_path=self.model_path, device=device)
+        return other
 
     # ---------------------------------------------------------------- 推理
     def inpaint_patch(self, patch_rgb, mask_01):
@@ -464,6 +510,7 @@ def process_video(
     inpainter: Optional[LamaInpainter] = None,
     model_path: Optional[str] = None,
     device: str = "auto",
+    workers: int = 0,
 ) -> ft.RunResult:
     """逐帧修复画面中的文字区域，再重新编码成视频。"""
     np = _load_numpy()
@@ -489,6 +536,8 @@ def process_video(
         inpainter = LamaInpainter(model_path=model_path, device=device)
     log(f"AI 修复模型：{inpainter.model_path}（加载 {inpainter.load_seconds:.1f}s）")
     log(f"推理后端：{', '.join(inpainter.providers)}")
+    if inpainter.fallback_note:
+        log(inpainter.fallback_note)
 
     # 预计算每个区域的修复块：区域大就拆块，保证每块原始像素 1:1 进模型
     jobs = []
@@ -501,6 +550,32 @@ def process_video(
         jobs.extend(tiles)
     if not jobs:
         raise ValueError("文字区域为空，请重新框选")
+
+    # 多路并行：CUDA 里部分算子会回退到 CPU（memcpy 停顿），两路各自持有一个
+    # 会话可以把这些停顿叠起来吃掉；实测 720p 双区域约提升 30%。短片并行反而
+    # 因为要多加载一次模型而变慢，所以只在足够长的视频上自动开启。
+    total = estimate_frames(info)
+    gpu = "CUDAExecutionProvider" in inpainter.providers
+    if workers <= 0:
+        workers = PARALLEL_WORKERS if (gpu and total >= PARALLEL_MIN_FRAMES) else 1
+    workers = max(1, min(3, int(workers)))
+    session_pool = None
+    if workers > 1:
+        pool = [inpainter]
+        try:
+            for _ in range(workers - 1):
+                pool.append(inpainter.clone())
+        except Exception as exc:
+            log(f"并行推理不可用，已退回单路：{exc}")
+            pool = [inpainter]
+        if len(pool) > 1:
+            session_pool = queue.Queue()
+            for item in pool:
+                session_pool.put(item)
+            workers = len(pool)
+            log(f"并行推理：{workers} 路独立会话")
+        else:
+            workers = 1
 
     decoder_cmd = [
         ffmpeg,
@@ -589,10 +664,50 @@ def process_video(
         threading.Thread(target=drain, args=(proc, name), daemon=True).start()
 
     frame_size = width * height * 3
-    total = estimate_frames(info)
     processed = 0
     last_emit = 0.0
     encode_ok = True
+
+    def apply_jobs(frame, session) -> None:
+        for box, pad, mask, alpha in jobs:
+            patch = frame[box.y : box.y + box.h, box.x : box.x + box.w]
+            if any(pad):
+                patch = np.pad(
+                    patch,
+                    ((pad[0], pad[2]), (pad[1], pad[3]), (0, 0)),
+                    mode="symmetric",
+                )
+            filled = session.inpaint_patch(patch, mask)
+            blended = filled.astype(np.float32) * alpha[..., None] + patch.astype(
+                np.float32
+            ) * (1.0 - alpha[..., None])
+            blended = np.clip(blended + 0.5, 0, 255).astype(np.uint8)
+            blended = blended[pad[0] : pad[0] + box.h, pad[1] : pad[1] + box.w]
+            frame[box.y : box.y + box.h, box.x : box.x + box.w] = blended
+
+    def frame_job(frame):
+        session = session_pool.get()
+        try:
+            apply_jobs(frame, session)
+        finally:
+            session_pool.put(session)
+        return frame
+
+    executor = ThreadPoolExecutor(max_workers=workers) if workers > 1 else None
+    pending: deque = deque()
+
+    def drain_one() -> bool:
+        """按帧序写出一个已完成结果。"""
+        nonlocal processed, last_emit
+        out = pending.popleft().result()
+        encoder.stdin.write(out.tobytes())
+        processed += 1
+        now = time.time()
+        if on_progress and (now - last_emit > 0.4 or processed <= 1):
+            last_emit = now
+            fraction = min(0.999, processed / total) if total else 0.0
+            on_progress(fraction, processed / fps if fps else 0.0)
+        return True
 
     try:
         assert decoder.stdout is not None and encoder.stdin is not None
@@ -605,34 +720,28 @@ def process_video(
                 break
             frame = np.frombuffer(buffer, dtype=np.uint8).reshape(height, width, 3).copy()
 
-            for box, pad, mask, alpha in jobs:
-                patch = frame[box.y : box.y + box.h, box.x : box.x + box.w]
-                if any(pad):
-                    patch = np.pad(
-                        patch,
-                        ((pad[0], pad[2]), (pad[1], pad[3]), (0, 0)),
-                        mode="symmetric",
-                    )
-                filled = inpainter.inpaint_patch(patch, mask)
-                blended = filled.astype(np.float32) * alpha[..., None] + patch.astype(
-                    np.float32
-                ) * (1.0 - alpha[..., None])
-                blended = np.clip(blended + 0.5, 0, 255).astype(np.uint8)
-                blended = blended[pad[0] : pad[0] + box.h, pad[1] : pad[1] + box.w]
-                frame[box.y : box.y + box.h, box.x : box.x + box.w] = blended
-
-            encoder.stdin.write(frame.tobytes())
-            processed += 1
-
-            now = time.time()
-            if on_progress and (now - last_emit > 0.4 or processed <= 1):
-                last_emit = now
-                fraction = min(0.999, processed / total) if total else 0.0
-                on_progress(fraction, processed / fps if fps else 0.0)
+            if executor is None:
+                apply_jobs(frame, inpainter)
+                encoder.stdin.write(frame.tobytes())
+                processed += 1
+                now = time.time()
+                if on_progress and (now - last_emit > 0.4 or processed <= 1):
+                    last_emit = now
+                    fraction = min(0.999, processed / total) if total else 0.0
+                    on_progress(fraction, processed / fps if fps else 0.0)
+            else:
+                pending.append(executor.submit(frame_job, frame))
+                while len(pending) > workers:
+                    drain_one()
+        if executor is not None and not cancelled:
+            while pending:
+                drain_one()
     except BrokenPipeError:
         encode_ok = False
         tail.append("编码进程提前退出（可能是磁盘空间或编码参数问题）")
     finally:
+        if executor is not None:
+            executor.shutdown(wait=False, cancel_futures=True)
         try:
             if encoder.stdin:
                 encoder.stdin.close()
