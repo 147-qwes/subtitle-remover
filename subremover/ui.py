@@ -204,6 +204,29 @@ class UiMixin:
             btn.pack(side="left", padx=(0, 4))
             self.region_widgets.append(btn)
 
+        # 区域列表：可以同时框住角标水印和底部字幕
+        ttk.Label(self.hard_frame, text="待修复区域").grid(
+            row=3, column=0, sticky="nw", pady=(10, 0)
+        )
+        list_row = ttk.Frame(self.hard_frame)
+        list_row.grid(row=3, column=1, columnspan=5, sticky="ew", pady=(10, 0))
+        list_row.columnconfigure(0, weight=1)
+
+        self.region_list_box = tk.Listbox(
+            list_row, height=3, exportselection=False, activestyle="none"
+        )
+        self.region_list_box.grid(row=0, column=0, sticky="ew")
+
+        region_buttons = ttk.Frame(list_row)
+        region_buttons.grid(row=0, column=1, sticky="n", padx=(8, 0))
+        ttk.Button(region_buttons, text="添加当前区域", command=self._add_region).pack(fill="x")
+        ttk.Button(region_buttons, text="删除选中", command=self._remove_region).pack(
+            fill="x", pady=4
+        )
+        ttk.Button(region_buttons, text="清空", command=self._clear_regions).pack(fill="x")
+
+        self.region_widgets.append(self.region_list_box)
+
         # 编码行
         ttk.Label(self.hard_frame, text="编码器 / 预设").grid(
             row=2, column=0, sticky="w", pady=(10, 0)
