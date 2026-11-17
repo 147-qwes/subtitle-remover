@@ -102,6 +102,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="AI 修复模型路径，默认自动在 models/ 与 env SUBTITLE_REMOVER_MODEL 里找",
     )
+    parser.add_argument(
+        "--parallel",
+        type=int,
+        default=0,
+        help="AI 修复并行路数：0=自动（长片在显卡上自动开 2 路），1=单路，2-3=指定",
+    )
     parser.add_argument("--outdir", default=None, help="输出目录，默认与源文件同目录")
     parser.add_argument("--suffix", default=remover.DEFAULT_SUFFIX, help="输出文件名后缀")
     parser.add_argument(
@@ -226,6 +232,7 @@ def main(argv: List[str]) -> int:
                     blur_radius=args.blur_radius,
                     model_path=args.model,
                     device=args.device,
+                    workers=args.parallel,
                     on_progress=on_progress,
                     on_log=on_log,
                 )

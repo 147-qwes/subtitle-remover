@@ -39,6 +39,13 @@ STYLE_LABELS: Dict[str, str] = {
 STYLE_KEYS = list(STYLE_LABELS.keys())
 STYLE_BY_KEY = {value: label for label, value in STYLE_LABELS.items()}
 
+DEVICE_LABELS: Dict[str, str] = {
+    "自动（有显卡用显卡）": "auto",
+    "CPU（兼容性最好）": "cpu",
+    "GPU（需要 NVIDIA 显卡）": "cuda",
+}
+DEVICE_KEYS = list(DEVICE_LABELS.keys())
+
 # (按钮文案, y 比例, 宽比例, 高比例)
 PRESETS = [
     ("底部 16%", 0.84, 1.0, 0.16),
