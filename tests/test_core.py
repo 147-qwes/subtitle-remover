@@ -400,6 +400,55 @@ class InpaintLogicTests(unittest.TestCase):
         # 每个块只负责自己那一格，合计等于区域像素数
         self.assertEqual(total, 1280 * 90)
 
+    def test_provider_candidates_fallback_to_cpu(self) -> None:
+        from subremover import inpaint
+
+        avail = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        # auto：先 GPU + CPU，失败再退纯 CPU
+        self.assertEqual(
+            inpaint.provider_candidates("auto", avail),
+            [["CUDAExecutionProvider", "CPUExecutionProvider"], ["CPUExecutionProvider"]],
+        )
+        # 强制 cuda 但运行时没有 CUDA：直接退 CPU，不再抛异常
+        self.assertEqual(
+            inpaint.provider_candidates("cuda", ["CPUExecutionProvider"]),
+            [["CPUExecutionProvider"]],
+        )
+        self.assertEqual(
+            inpaint.provider_candidates("cpu", avail), [["CPUExecutionProvider"]]
+        )
+
+    def test_inpaint_duplicate_region_is_merged(self) -> None:
+        """GUI / CLI 会同时传 region 与 regions，同一块区域不能修两次。"""
+        from subremover import inpaint
+
+        captured = {}
+
+        def fake_process(src, dst, info, regions, **kwargs):
+            captured["regions"] = list(regions)
+            return ft.RunResult(returncode=0, cancelled=False, seconds=0.0, log_tail="")
+
+        original = inpaint.process_video
+        inpaint.process_video = fake_process
+        try:
+            subtitle = ft.Region(0, 620, 1280, 90)
+            watermark = ft.Region(0, 0, 360, 64)
+            remover.remove_hard_subtitles(
+                os.path.join(tempfile.gettempdir(), "in.mp4"),
+                os.path.join(tempfile.gettempdir(), "out.mp4"),
+                make_info(),
+                ft.INPAINT_STYLE,
+                region=subtitle,
+                regions=[subtitle, watermark],
+            )
+        finally:
+            inpaint.process_video = original
+
+        self.assertEqual(len(captured["regions"]), 2)
+        self.assertEqual([(r.x, r.y, r.w, r.h) for r in captured["regions"]],
+                         [(0, 620, 1280, 90), (0, 0, 360, 64)])
+
+
 
 if __name__ == "__main__":
     unittest.main()
