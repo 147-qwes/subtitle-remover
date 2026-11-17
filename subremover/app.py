@@ -16,8 +16,8 @@ from tkinter import filedialog, messagebox, ttk
 from typing import Dict, List, Optional
 
 from . import ffmpeg_tools as ft
-from . import remover
-from .constants import STYLE_LABELS, VIDEO_EXTS, VIDEO_FILETYPES
+from . import inpaint, remover
+from .constants import STYLE_BY_KEY, STYLE_LABELS, VIDEO_EXTS, VIDEO_FILETYPES
 from .dnd import AVAILABLE as DND_AVAILABLE
 from .dnd import TkinterDnD
 from .models import FileRow
@@ -37,6 +37,7 @@ class SubtitleRemoverApp(UiMixin, _BaseWindow):
         self._rows: Dict[str, FileRow] = {}
         self._order: List[str] = []
         self._next_id = 0
+        self._region_items: List[tuple] = []
         self._events: "queue.Queue[tuple]" = queue.Queue()
         self._cancel = threading.Event()
         self._running = False
@@ -46,6 +47,10 @@ class SubtitleRemoverApp(UiMixin, _BaseWindow):
         self._build_ui()
         self._on_mode_change()
         self._on_style_change()
+
+        # 装了 AI 修复模型时，默认就用"重绘"方式（不留遮挡）
+        if inpaint.find_model_path():
+            self.style_var.set(STYLE_BY_KEY.get("inpaint", self.style_var.get()))
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(120, self._poll_events)
@@ -246,13 +251,68 @@ class SubtitleRemoverApp(UiMixin, _BaseWindow):
         style = STYLE_LABELS.get(self.style_var.get(), "crop_bottom")
         if style in ("crop_bottom", "crop_top"):
             self.ratio_var.set(f"{relative.h * 100:.1f}")
-            self.style_var.set(list(STYLE_LABELS)[2])  # 自动切到模糊遮罩
+            best = "inpaint" if inpaint.find_model_path() else "blur"
+            self.style_var.set(STYLE_BY_KEY.get(best, self.style_var.get()))
             self._on_style_change()
-            self._append_log("已自动切换到「模糊遮罩」：框选区域只覆盖字幕，裁切会误伤画面")
+            if best == "inpaint":
+                self._append_log("已切到「AI 修复」：只重绘框选区域，画面尺寸和人物细节都保留")
+        self._append_region(relative.x * 100, relative.y * 100, relative.w * 100, relative.h * 100)
         self._append_log(
-            f"区域已设为 x={region.x} y={region.y} w={region.w} h={region.h}"
+            f"区域已加入列表：x={region.x} y={region.y} w={region.w} h={region.h}"
             f"（{row.info.width}×{row.info.height}）"
         )
+
+    def _current_region_values(self) -> tuple:
+        return (
+            float(self.region_vars["x"].get()),
+            float(self.region_vars["y"].get()),
+            float(self.region_vars["w"].get()),
+            float(self.region_vars["h"].get()),
+        )
+
+    def _add_region(self) -> None:
+        try:
+            x, y, w, h = self._current_region_values()
+        except ValueError:
+            messagebox.showwarning("参数有误", "区域必须是数字（百分比）", parent=self)
+            return
+        self._append_region(x, y, w, h)
+
+    def _append_region(self, x: float, y: float, w: float, h: float) -> None:
+        if w <= 0 or h <= 0:
+            messagebox.showwarning("参数有误", "区域的宽、高必须大于 0", parent=self)
+            return
+        if x < 0 or y < 0 or x + w > 100.5 or y + h > 100.5:
+            messagebox.showwarning(
+                "参数有误", "区域超出了画面范围（X/宽、Y/高 相加不能超过 100%）", parent=self
+            )
+            return
+        item = (round(x, 1), round(y, 1), round(w, 1), round(h, 1))
+        if item in self._region_items:
+            self._append_log("该区域已在列表中")
+            return
+        self._region_items.append(item)
+        self._refresh_region_list()
+
+    def _refresh_region_list(self) -> None:
+        self.region_list_box.delete(0, "end")
+        for index, (x, y, w, h) in enumerate(self._region_items, 1):
+            self.region_list_box.insert(
+                "end", f"{index}) x={x:.1f}%  y={y:.1f}%  w={w:.1f}%  h={h:.1f}%"
+            )
+
+    def _remove_region(self) -> None:
+        selection = list(self.region_list_box.curselection())
+        if not selection:
+            return
+        for index in reversed(selection):
+            if 0 <= index < len(self._region_items):
+                self._region_items.pop(index)
+        self._refresh_region_list()
+
+    def _clear_regions(self) -> None:
+        self._region_items.clear()
+        self._refresh_region_list()
 
     def _choose_outdir(self) -> None:
         directory = filedialog.askdirectory(title="选择输出目录", parent=self)
@@ -288,22 +348,28 @@ class SubtitleRemoverApp(UiMixin, _BaseWindow):
         config["preset"] = self.preset_var.get() or "medium"
         config["encoder"] = self.encoder_var.get() or "libx264"
         config["region"] = None
+        config["regions"] = []
 
-        if style in ("blur", "delogo"):
-            try:
-                x = float(self.region_vars["x"].get())
-                y = float(self.region_vars["y"].get())
-                w = float(self.region_vars["w"].get())
-                h = float(self.region_vars["h"].get())
-            except ValueError:
-                raise ValueError("字幕区域的 X / Y / 宽 / 高 必须是数字（百分比）")
-            if w <= 0 or h <= 0:
-                raise ValueError("字幕区域的宽、高必须大于 0")
-            if x + w > 100.5 or y + h > 100.5:
-                raise ValueError("字幕区域超出了画面范围（X+宽、Y+高 不能超过 100%）")
-            config["region"] = ft.RelativeRegion(
-                x / 100.0, y / 100.0, w / 100.0, h / 100.0
-            )
+        if style in ("blur", "delogo", "inpaint"):
+            items = list(self._region_items)
+            if not items:
+                try:
+                    items = [self._current_region_values()]
+                except ValueError:
+                    raise ValueError("字幕区域的 X / Y / 宽 / 高 必须是数字（百分比）")
+            if style in ("blur", "delogo") and len(items) > 1:
+                raise ValueError(
+                    "模糊 / delogo 一次只能处理一个区域；要同时去水印和字幕，请用 AI 修复"
+                )
+            regions = []
+            for x, y, w, h in items:
+                if w <= 0 or h <= 0:
+                    raise ValueError("字幕区域的宽、高必须大于 0")
+                if x < 0 or y < 0 or x + w > 100.5 or y + h > 100.5:
+                    raise ValueError("字幕区域超出了画面范围（X+宽、Y+高 不能超过 100%）")
+                regions.append(ft.RelativeRegion(x / 100.0, y / 100.0, w / 100.0, h / 100.0))
+            config["regions"] = regions
+            config["region"] = regions[0]
         return config
 
     # ------------------------------------------------------------------ 执行
@@ -378,20 +444,25 @@ class SubtitleRemoverApp(UiMixin, _BaseWindow):
 
             mode = config["mode"]
             region = None
+            regions_px: List[ft.Region] = []
             if mode == remover.HARD_MODE:
-                if config.get("region") is not None:
+                if config.get("regions"):
                     if not info.has_video_dimensions:
                         self._events.put(("status", row.iid, "无视频画面"))
                         failed += 1
                         continue
-                    region = config["region"].to_pixels(info.width, info.height)
-                    self._events.put(
-                        (
-                            "log",
-                            f"字幕区域（像素）：x={region.x} y={region.y} "
-                            f"w={region.w} h={region.h}",
+                    regions_px = [
+                        r.to_pixels(info.width, info.height) for r in config["regions"]
+                    ]
+                    region = regions_px[0] if regions_px else None
+                    for item in regions_px:
+                        self._events.put(
+                            (
+                                "log",
+                                f"修复区域（像素）：x={item.x} y={item.y} "
+                                f"w={item.w} h={item.h}",
+                            )
                         )
-                    )
                 self._events.put(("log", f"模式：硬字幕去除 / {config['style']}"))
             else:
                 self._events.put(("log", "模式：软字幕轨移除（-c copy）"))
@@ -412,6 +483,7 @@ class SubtitleRemoverApp(UiMixin, _BaseWindow):
                         info,
                         config["style"],
                         region=region,
+                        regions=regions_px,
                         height_ratio=config.get("height_ratio"),
                         crf=config.get("crf", 23),
                         preset=config.get("preset", "medium"),
@@ -535,6 +607,13 @@ class SubtitleRemoverApp(UiMixin, _BaseWindow):
             self._append_log("⚠ 未检测到 ffmpeg，请先运行 tools/setup_ffmpeg.ps1 或安装 ffmpeg。")
             return
         self._append_log(f"ffmpeg：{ffmpeg}")
+        model = inpaint.find_model_path()
+        if model:
+            self._append_log(f"AI 修复模型：{model}")
+        else:
+            self._append_log(
+                "AI 修复未就绪：运行 tools\\setup_model.ps1 下载模型后，可做到去字不留遮挡"
+            )
 
     def _show_ffmpeg_info(self) -> None:
         ft.clear_binary_cache()
@@ -576,11 +655,13 @@ class SubtitleRemoverApp(UiMixin, _BaseWindow):
             "2. 选择模式：\n"
             "   · 软字幕轨移除：视频内的字幕流（mkv 内封、mp4 的 mov_text 等），\n"
             "     -c copy 无损移除，几秒完成。\n"
-            "   · 硬字幕去除：字幕已烧进画面。\n"
+            "   · 硬字幕 / 水印去除：文字已经烧进画面。\n"
+            "     - AI 修复：按四周画面重绘文字区域，去字不留遮挡，人物场景依旧清晰（推荐，较慢）；\n"
             "     - 裁切：直接切掉底部/顶部一条，画面变矮，最快最好；\n"
-            "     - 模糊：字幕位置打模糊，画面尺寸不变；\n"
-            "     - delogo：按周围像素插值抹除，字幕背后是纯色时效果最好。\n"
-            "3. 硬字幕的模糊/delogo 建议点「框选区域」，在真实画面上拖框。\n"
+            "     - 模糊：字幕位置打模糊，会留下模糊带；\n"
+            "     - delogo：按周围像素插值，背景复杂时会糊。\n"
+            "3. 「待修复区域」列表可以加多块：角标水印一块、底部字幕一块，一次跑完。\n"
+            "   点「框选区域…」在真实画面上拖框最准；也可以填百分比后点「添加当前区域」。\n"
             "4. 设置输出目录（留空 = 源文件同目录），点「开始处理」。\n\n"
             "提示：字幕位置逐帧移动、或背景复杂的视频，模糊/delogo 会有痕迹；\n"
             "裁切是最稳妥的硬字幕方案。"
