@@ -1,0 +1,26 @@
+# ffmpeg / ffprobe 可执行文件（用 tools/setup_ffmpeg.ps1 下载到这里）
+bin/
+tools/ffmpeg.zip
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# PyInstaller
+build/
+dist/
+*.spec
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# 本地测试素材
+tmp/
+*.log

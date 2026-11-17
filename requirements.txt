@@ -1,0 +1,2 @@
+# 运行本身只依赖 Python 标准库 + ffmpeg，无需安装任何 pip 包。
+# 可选增强见 requirements-optional.txt
