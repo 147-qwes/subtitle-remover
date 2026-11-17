@@ -17,7 +17,7 @@ from typing import Dict, List, Optional
 
 from . import ffmpeg_tools as ft
 from . import inpaint, remover
-from .constants import STYLE_BY_KEY, STYLE_LABELS, VIDEO_EXTS, VIDEO_FILETYPES
+from .constants import DEVICE_LABELS, STYLE_BY_KEY, STYLE_LABELS, VIDEO_EXTS, VIDEO_FILETYPES
 from .dnd import AVAILABLE as DND_AVAILABLE
 from .dnd import TkinterDnD
 from .models import FileRow
@@ -201,6 +201,9 @@ class SubtitleRemoverApp(UiMixin, _BaseWindow):
         region_state = "disabled" if crop_mode else "normal"
         for widget in self.region_widgets:
             widget.configure(state=region_state)
+        for widget in getattr(self, "device_widgets", []):
+            if isinstance(widget, ttk.Combobox):
+                widget.configure(state="readonly" if style == "inpaint" else "disabled")
 
     def _apply_preset(self, y_ratio: float, w_ratio: float, h_ratio: float) -> None:
         self.region_vars["x"].set("0")
@@ -347,6 +350,7 @@ class SubtitleRemoverApp(UiMixin, _BaseWindow):
         config["crf"] = min(35, max(0, crf))
         config["preset"] = self.preset_var.get() or "medium"
         config["encoder"] = self.encoder_var.get() or "libx264"
+        config["device"] = DEVICE_LABELS.get(self.device_var.get(), "auto")
         config["region"] = None
         config["regions"] = []
 
@@ -488,6 +492,7 @@ class SubtitleRemoverApp(UiMixin, _BaseWindow):
                         crf=config.get("crf", 23),
                         preset=config.get("preset", "medium"),
                         encoder=config.get("encoder", "libx264"),
+                        device=config.get("device", "auto"),
                         on_progress=on_progress,
                         on_log=on_log,
                         cancel=self._cancel,
