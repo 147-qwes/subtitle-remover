@@ -50,7 +50,7 @@ def collect_inputs(paths: List[str], recursive: bool) -> List[str]:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="subtitle-remover",
-        description="视频去字幕工具（软字幕轨无损移除 / 硬字幕裁切·模糊·delogo）",
+        description="视频去字幕工具（软字幕轨无损移除 / 硬字幕裁切·模糊·delogo / AI 修复）",
     )
     parser.add_argument("inputs", nargs="*", help="视频文件或目录")
     parser.add_argument(
@@ -61,17 +61,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--style",
-        choices=list(ft.HARD_STYLES),
+        choices=list(ft.ALL_STYLES),
         default="crop_bottom",
-        help="硬字幕处理方式：crop_bottom / crop_top / blur / delogo",
+        help="处理方式：crop_bottom / crop_top / blur / delogo / inpaint（AI 修复，去字不留遮挡）",
     )
     parser.add_argument(
         "--region",
-        help="硬字幕区域（像素）：x,y,w,h，例如 0,900,1920,180",
+        action="append",
+        help="文字/水印区域（像素）：x,y,w,h，可重复给出多个区域",
     )
     parser.add_argument(
         "--region-percent",
-        help="硬字幕区域（百分比）：x,y,w,h，例如 0,80,100,20",
+        action="append",
+        help="文字/水印区域（百分比）：x,y,w,h，可重复给出多个区域",
     )
     parser.add_argument(
         "--height-ratio",
@@ -89,6 +91,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--encoder", default="libx264", choices=["libx264", "libx265"]
     )
     parser.add_argument("--blur-radius", type=int, default=None, help="模糊半径，默认自动")
+    parser.add_argument(
+        "--device",
+        choices=["auto", "cpu", "cuda"],
+        default="auto",
+        help="AI 修复推理设备：auto 有 GPU 就先用 GPU，默认 auto",
+    )
+    parser.add_argument(
+        "--model",
+        default=None,
+        help="AI 修复模型路径，默认自动在 models/ 与 env SUBTITLE_REMOVER_MODEL 里找",
+    )
     parser.add_argument("--outdir", default=None, help="输出目录，默认与源文件同目录")
     parser.add_argument("--suffix", default=remover.DEFAULT_SUFFIX, help="输出文件名后缀")
     parser.add_argument(
@@ -123,18 +136,28 @@ def main(argv: List[str]) -> int:
         print("没有找到可处理的视频文件。", file=sys.stderr)
         return 2
 
-    relative = None
-    if args.mode == remover.HARD_MODE and args.style in ("blur", "delogo"):
-        if args.region_percent:
-            parts = [float(x) for x in args.region_percent.split(",")]
+    percent_regions: List[ft.RelativeRegion] = []
+    pixel_regions: List[ft.Region] = []
+    if args.mode == remover.HARD_MODE and args.style in ("blur", "delogo", ft.INPAINT_STYLE):
+        for text in args.region_percent or []:
+            parts = [float(x) for x in text.split(",")]
             if len(parts) != 4:
                 print("--region-percent 需要 4 个数字", file=sys.stderr)
                 return 2
-            relative = ft.RelativeRegion(
-                parts[0] / 100, parts[1] / 100, parts[2] / 100, parts[3] / 100
+            percent_regions.append(
+                ft.RelativeRegion(parts[0] / 100, parts[1] / 100, parts[2] / 100, parts[3] / 100)
             )
-        elif not args.region:
-            print("blur / delogo 模式需要用 --region 或 --region-percent 指定区域", file=sys.stderr)
+        for text in args.region or []:
+            try:
+                pixel_regions.append(ft.parse_region(text))
+            except ValueError as exc:
+                print(f"--region 格式有误：{exc}", file=sys.stderr)
+                return 2
+        if not percent_regions and not pixel_regions:
+            print(
+                f"{args.style} 模式需要用 --region 或 --region-percent 指定区域",
+                file=sys.stderr,
+            )
             return 2
 
     keep_subs = (
@@ -167,11 +190,13 @@ def main(argv: List[str]) -> int:
         print(f"  输出：{dst}")
 
         region = None
-        if args.mode == remover.HARD_MODE and args.style in ("blur", "delogo"):
-            if relative is not None:
-                region = relative.to_pixels(info.width, info.height)
-            else:
-                region = ft.parse_region(args.region)
+        regions_px: List[ft.Region] = []
+        if args.mode == remover.HARD_MODE and args.style in ("blur", "delogo", ft.INPAINT_STYLE):
+            for relative_region in percent_regions:
+                regions_px.append(relative_region.to_pixels(info.width, info.height))
+            regions_px.extend(pixel_regions)
+            if regions_px:
+                region = regions_px[0]
 
         last_line = {"pct": -10.0}
 
@@ -193,11 +218,14 @@ def main(argv: List[str]) -> int:
                     info,
                     args.style,
                     region=region,
+                    regions=regions_px,
                     height_ratio=args.height_ratio,
                     crf=args.crf,
                     preset=args.preset,
                     encoder=args.encoder,
                     blur_radius=args.blur_radius,
+                    model_path=args.model,
+                    device=args.device,
                     on_progress=on_progress,
                     on_log=on_log,
                 )
