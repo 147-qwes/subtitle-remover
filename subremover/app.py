@@ -612,7 +612,7 @@ class SubtitleRemoverApp(UiMixin, _BaseWindow):
             self._append_log(f"AI 修复模型：{model}")
         else:
             self._append_log(
-                "AI 修复未就绪：运行 tools\\setup_model.ps1 下载模型后，可做到去字不留遮挡"
+                "AI 修复未就绪：运行 python tools\\download_model.py 下载模型后，可做到去字不留遮挡"
             )
 
     def _show_ffmpeg_info(self) -> None:
