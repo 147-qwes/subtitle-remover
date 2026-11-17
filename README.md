@@ -36,7 +36,7 @@
 powershell -ExecutionPolicy Bypass -File tools\setup_ffmpeg.ps1
 ```
 
-脚本会把 `ffmpeg.exe`、`ffprobe.exe` 下载并放到项目的 `bin\` 目录，程序启动时自动识别。
+脚本会把 `ffmpeg.exe`、`ffprobe.exe` 下载并放到项目的 `bin\` 目录（自带 gyan.dev 与 BtbN 两个下载源，一个失败自动换另一个），程序启动时自动识别。
 
 **方式 B：手动安装**
 
@@ -125,7 +125,11 @@ subtitle-remover/
 ├── subremover/
 │   ├── ffmpeg_tools.py        # 定位 ffmpeg、ffprobe 解析、命令构建、进度执行
 │   ├── remover.py             # 输出路径与单文件处理流程
-│   ├── app.py                 # 主窗口（文件队列 / 参数面板 / 进度 / 日志）
+│   ├── app.py                 # 主窗口逻辑：文件队列 / 参数收集 / 批量执行 / 事件
+│   ├── ui.py                  # 界面布局：样式、菜单、控件（app.py 继承 UiMixin）
+│   ├── constants.py           # 文件类型、样式文案、预设区域
+│   ├── models.py              # 文件列表行数据模型
+│   ├── dnd.py                 # 拖拽依赖 tkinterdnd2 的可选探测
 │   ├── region_picker.py       # 抽帧 + 拖拽框选字幕区域
 │   └── cli.py                 # 命令行
 ├── tests/test_core.py         # 单元测试（无需安装 ffmpeg）
@@ -172,6 +176,8 @@ python -m unittest discover -s tests -v
 ```
 
 测试覆盖：ffprobe JSON 解析、区域换算与边界裁剪、软/硬字幕命令构建、输出命名去重、进度输出解析。测试不依赖真实 ffmpeg。
+
+真机验证除单元测试外，另用 ffmpeg 生成带软字幕 / 硬字幕样例做了端到端测试：软字幕移除后字幕流归零且视频仍为 h264（未重编码）、音频保留；裁切、模糊、delogo 输出尺寸与 PSNR 均符合预期；取消操作能中断 ffmpeg 进程。
 
 ## 许可
 
