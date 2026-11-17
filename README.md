@@ -98,13 +98,48 @@ python main.py
 
 ### 5. 打包成 exe（可选）
 
+两个版本，功能完全一致，只是推理引擎不同：
+
+| 版本 | 体积 | 依赖 | 实测速度（720p 双区域） |
+| --- | --- | --- | --- |
+| **CPU 版**（单文件 exe） | exe 37 MB，整包约 560 MB | 无显卡要求 | 0.1–0.2 帧/秒 |
+| **GPU 版**（文件夹版） | 约 3.2 GB（含 CUDA 12 运行库、ffmpeg 与模型） | 只需 NVIDIA 驱动 | 0.5–0.7 帧/秒 |
+
+**CPU 版**
+
 ```powershell
-pip install pyinstaller
-powershell -ExecutionPolicy Bypass -File build_exe.ps1
+pip install onnxruntime numpy pyinstaller
+python -m PyInstaller --noconfirm --clean --windowed --onefile `
+  --name SubtitleRemover-CPU --hidden-import onnxruntime main.py
 ```
 
-产物为 `dist\SubtitleRemover.exe` 与 `dist\bin\`（ffmpeg），把这两者放在同一目录即可双击使用。
-AI 修复还需要 `models\lama_fp32.onnx`：把它放到 exe 同级的 `models\` 目录下即可。
+**GPU 版**（onedir，且要把 pip 装进来的 CUDA 运行库一起带进包里）
+
+```powershell
+pip install "onnxruntime-gpu==1.22.0" numpy pyinstaller
+pip install nvidia-cublas-cu12 nvidia-cudnn-cu12 nvidia-cufft-cu12 `
+  nvidia-cuda-runtime-cu12 nvidia-curand-cu12
+python -m PyInstaller --noconfirm --clean --windowed --onedir `
+  --name SubtitleRemover-GPU --collect-all onnxruntime main.py
+
+# 把 nvidia 运行库放到 _internal\nvidia\，程序启动会自动挂进 DLL 搜索路径
+$nv = python -c "import site,os;print(os.path.join(site.getsitepackages()[0],'nvidia'))"
+Copy-Item -Recurse $nv "dist\SubtitleRemover-GPU\_internal\nvidia"
+```
+
+两个版本都需要把 `bin\`（ffmpeg、ffprobe）和 `models\lama_fp32.onnx` 放到 exe 同目录：
+CPU 版是单文件，直接和 exe 并排放；GPU 版是文件夹，放在 `SubtitleRemover-GPU\` 里面。
+GPU 版不需要装 CUDA Toolkit、Python 或 pip，只要显卡驱动正常。
+
+窗口版 exe 没有控制台，所以 `--cli` 的输出会写进 exe 同目录的
+`subtitle-remover-cli.log`，跑完看那个文件即可。
+
+已实测（i5-12450H + RTX 4060 Laptop）：
+
+- CPU 版：640×360 单区域 4 帧，56.3 s（约 14 s/帧）
+- GPU 版：同素材 15.7 s（其中 12.5 s 是模型加载）；完整 720p 30 帧、两块区域 44.5 s，
+  输出帧文字区 PSNR 21.42 dB，与源码运行结果完全一致
+- GPU 版若驱动过旧用不上显卡，会自动退回 CPU，日志里显示「推理后端：CPUExecutionProvider」
 
 ## 怎么判断该用哪种模式
 
