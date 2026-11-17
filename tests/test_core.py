@@ -252,5 +252,154 @@ class MiscTests(unittest.TestCase):
             self.assertTrue(remover.output_path(src, None, "  ").endswith("a_nosub.mkv"))
 
 
+class InpaintLogicTests(unittest.TestCase):
+    """AI 修复的几何逻辑（不需要模型和 onnxruntime）。"""
+
+    def test_parse_fps(self) -> None:
+        self.assertAlmostEqual(ft.parse_fps("25/1"), 25.0)
+        self.assertAlmostEqual(ft.parse_fps("30000/1001"), 29.97, places=2)
+        self.assertAlmostEqual(ft.parse_fps("24"), 24.0)
+        self.assertEqual(ft.parse_fps("0/0"), 0.0)
+        self.assertEqual(ft.parse_fps(None), 0.0)
+
+    def test_media_frame_rate_fallback(self) -> None:
+        info = make_info()
+        self.assertEqual(info.fps, 0.0)
+        self.assertEqual(info.frame_rate, 25.0)
+
+    def test_expand_region_adds_context(self) -> None:
+        from subremover import inpaint
+
+        region = ft.Region(100, 800, 400, 100)
+        box = inpaint.expand_region(region, 1920, 1080)
+        self.assertLessEqual(box.x, 100)
+        self.assertLessEqual(box.y, 800)
+        self.assertGreaterEqual(box.x + box.w, 500)
+        self.assertGreaterEqual(box.y + box.h, 900)
+        self.assertGreaterEqual(box.w, region.w)
+        self.assertGreaterEqual(box.h, region.h)
+
+    def test_expand_region_stays_inside_frame(self) -> None:
+        from subremover import inpaint
+
+        box = inpaint.expand_region(ft.Region(0, 1000, 1920, 80), 1920, 1080)
+        self.assertGreaterEqual(box.x, 0)
+        self.assertGreaterEqual(box.y, 0)
+        self.assertLessEqual(box.x + box.w, 1920)
+        self.assertLessEqual(box.y + box.h, 1080)
+
+    def test_inner_box_maps_into_patch(self) -> None:
+        from subremover import inpaint
+
+        region = ft.Region(100, 800, 400, 100)
+        box = inpaint.expand_region(region, 1920, 1080)
+        x0, y0, x1, y1 = inpaint.inner_box(region, box.x, box.y, box.w, box.h)
+        self.assertEqual((x0, y0), (region.x - box.x, region.y - box.y))
+        self.assertEqual(x1 - x0, region.w)
+        self.assertEqual(y1 - y0, region.h)
+        self.assertLessEqual(x1, box.w)
+        self.assertLessEqual(y1, box.h)
+
+    def test_pad_to_multiple(self) -> None:
+        from subremover import inpaint
+
+        self.assertEqual(inpaint.pad_to_multiple(100), 104)
+        self.assertEqual(inpaint.pad_to_multiple(16), 16)
+        self.assertEqual(inpaint.pad_to_multiple(1), 8)
+
+    def test_merge_overlapping_regions(self) -> None:
+        from subremover import inpaint
+
+        merged = inpaint.merge_into_list(
+            [ft.Region(0, 900, 1920, 180)], ft.Region(0, 880, 100, 60)
+        )
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0].y, 880)
+        self.assertGreaterEqual(merged[0].h, 200)
+
+    def test_merge_keeps_separate_regions(self) -> None:
+        from subremover import inpaint
+
+        merged = inpaint.merge_into_list(
+            [ft.Region(0, 0, 200, 60)], ft.Region(0, 900, 1920, 180)
+        )
+        self.assertEqual(len(merged), 2)
+
+    def test_model_path_can_be_pointed_by_env(self) -> None:
+        from subremover import inpaint
+
+        paths = inpaint.model_search_paths()
+        self.assertTrue(any("models" in p for p in paths))
+        # 下载中断的空文件不能当成可用模型
+        self.assertFalse(inpaint._is_usable_model(__file__))
+
+    def test_feather_alpha_is_soft_edged(self) -> None:
+        from subremover import inpaint
+
+        try:
+            import numpy as np  # noqa: F401
+        except Exception:
+            self.skipTest("numpy 未安装")
+        np = __import__("numpy")
+        mask = np.zeros((40, 60), dtype=np.uint8)
+        mask[10:30, 15:45] = 1
+        alpha = inpaint.feather_alpha(mask, radius=3)
+        self.assertEqual(alpha.shape, mask.shape)
+        self.assertAlmostEqual(float(alpha[20, 30]), 1.0, places=2)
+        self.assertAlmostEqual(float(alpha[0, 0]), 0.0, places=2)
+        # 边界处存在 0~1 的过渡，拼接不会有硬缝
+        self.assertTrue(((alpha > 0.05) & (alpha < 0.95)).any())
+
+    def test_context_box_pads_at_frame_edge(self) -> None:
+        from subremover import inpaint
+
+        # 贴左上角的角标：左侧和上方没有画面，需要镜像补边
+        box, pad = inpaint.context_box(ft.Region(0, 0, 300, 60), 1920, 1080)
+        self.assertEqual(box.x, 0)
+        self.assertEqual(box.y, 0)
+        self.assertGreater(pad[0], 0)
+        self.assertGreater(pad[1], 0)
+
+    def test_context_box_no_pad_in_middle(self) -> None:
+        from subremover import inpaint
+
+        box, pad = inpaint.context_box(ft.Region(600, 400, 400, 100), 1920, 1080)
+        self.assertEqual(pad, (0, 0, 0, 0))
+        self.assertLessEqual(box.x, 600)
+        self.assertLess(box.y, 400)
+
+    def test_plan_tiles_covers_region_and_fits_model(self) -> None:
+        from subremover import inpaint
+
+        try:
+            import numpy as np  # noqa: F401
+        except Exception:
+            self.skipTest("numpy 未安装")
+        np = __import__("numpy")
+        region = ft.Region(0, 620, 1280, 90)
+        tiles = inpaint.plan_tiles(region, 1280, 720)
+        self.assertGreaterEqual(len(tiles), 2)
+        covered = np.zeros((720, 1280), dtype=np.uint8)
+        for box, pad, mask, _alpha in tiles:
+            self.assertLessEqual(mask.shape[0] + 0, 512)
+            self.assertLessEqual(mask.shape[1] + 0, 512)
+            covered[box.y : box.y + box.h, box.x : box.x + box.w] = 1
+        # 拆分后整条字幕带都要被覆盖到
+        self.assertEqual(int(covered[620:710, :].min()), 1)
+
+    def test_plan_tiles_mask_is_only_own_core(self) -> None:
+        from subremover import inpaint
+
+        try:
+            import numpy as np  # noqa: F401
+        except Exception:
+            self.skipTest("numpy 未安装")
+        np = __import__("numpy")
+        tiles = inpaint.plan_tiles(ft.Region(0, 620, 1280, 90), 1280, 720)
+        total = sum(int(mask.sum()) for _b, _p, mask, _a in tiles)
+        # 每个块只负责自己那一格，合计等于区域像素数
+        self.assertEqual(total, 1280 * 90)
+
+
 if __name__ == "__main__":
     unittest.main()
