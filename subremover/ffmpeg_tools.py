@@ -2,7 +2,7 @@
 
 职责：
 1. 定位 ffmpeg、ffprobe 可执行文件（环境变量 -> 程序目录 bin -> PATH -> 常见安装位置）；
-2. 解析媒体信息（时长、分辨率、字幕流列表）；
+2. 解析媒体信息（时长、分辨率、帧率、字幕流列表）；
 3. 构建两类处理命令：软字幕轨无损移除、硬字幕（画面内烧录字幕）去除；
 4. 带进度回调地执行命令，支持取消。
 """
@@ -28,6 +28,10 @@ EXE_SUFFIX = ".exe" if os.name == "nt" else ""
 
 # 硬字幕处理方式 -> ffmpeg 参数
 HARD_STYLES = ("crop_bottom", "crop_top", "blur", "delogo")
+
+# AI 修复（不是 ffmpeg 滤镜，由 inpaint.py 逐帧重绘）
+INPAINT_STYLE = "inpaint"
+ALL_STYLES = HARD_STYLES + (INPAINT_STYLE,)
 
 
 class FFmpegNotFound(RuntimeError):
@@ -128,6 +132,7 @@ class StreamInfo:
     width: Optional[int] = None
     height: Optional[int] = None
     duration: float = 0.0
+    fps: float = 0.0
     default: bool = False
     forced: bool = False
 
@@ -182,6 +187,17 @@ class MediaInfo:
         return bool(self.width and self.height)
 
     @property
+    def fps(self) -> float:
+        stream = self.first_video
+        return float(stream.fps or 0.0) if stream else 0.0
+
+    @property
+    def frame_rate(self) -> float:
+        """可用的帧率，缺帧率信息时退回 25fps 以驱动管道。"""
+        value = self.fps
+        return value if value > 0.1 else 25.0
+
+    @property
     def subtitle_count(self) -> int:
         return len(self.subtitle_streams)
 
@@ -200,6 +216,25 @@ def _to_float(value, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def parse_fps(value) -> float:
+    """解析 ffprobe 的帧率写法：'25/1'、'30000/1001' 或 '25'。"""
+    if not value:
+        return 0.0
+    text = str(value)
+    if "/" in text:
+        num_text, _, den_text = text.partition("/")
+        try:
+            num = float(num_text)
+            den = float(den_text)
+        except ValueError:
+            return 0.0
+        return num / den if den else 0.0
+    try:
+        return float(text)
+    except ValueError:
+        return 0.0
 
 
 def parse_probe_json(data: dict, path: str) -> MediaInfo:
@@ -221,6 +256,7 @@ def parse_probe_json(data: dict, path: str) -> MediaInfo:
             width=raw.get("width"),
             height=raw.get("height"),
             duration=_to_float(raw.get("duration")),
+            fps=parse_fps(raw.get("avg_frame_rate") or raw.get("r_frame_rate")),
             default=bool(disposition.get("default", 0)),
             forced=bool(disposition.get("forced", 0)),
         )
@@ -431,6 +467,8 @@ def build_hard_remove_command(
       crop_top     裁掉画面顶部一条
       blur         在字幕区域打模糊遮罩
       delogo       用 delogo 滤镜按周围像素插值抹掉字幕
+
+    注意：inpaint（AI 修复）不走 ffmpeg 滤镜，由 inpaint.py 逐帧重绘。
     """
     if style not in HARD_STYLES:
         raise ValueError(f"未知的硬字幕处理方式：{style}")
