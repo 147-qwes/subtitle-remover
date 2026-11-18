@@ -63,12 +63,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--style",
         choices=list(ft.ALL_STYLES),
         default="crop_bottom",
-        help="处理方式：crop_bottom / crop_top / blur / delogo / inpaint（AI 修复，去字不留遮挡）",
+        help=(
+            "处理方式：crop_bottom / crop_top / blur / delogo 走 ffmpeg；"
+            "inpaint = 固定区域重绘；auto = 逐帧自动检测文字再重绘（动态字幕用，可不给区域）"
+        ),
     )
     parser.add_argument(
         "--region",
         action="append",
-        help="文字/水印区域（像素）：x,y,w,h，可重复给出多个区域",
+        help="文字/水印区域（像素）：x,y,w,h，可重复给出多个；--style auto 时作为搜索范围（可省略）",
     )
     parser.add_argument(
         "--region-percent",
@@ -101,6 +104,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--model",
         default=None,
         help="AI 修复模型路径，默认自动在 models/ 与 env SUBTITLE_REMOVER_MODEL 里找",
+    )
+    parser.add_argument(
+        "--det-model",
+        default=None,
+        help="文字检测模型路径（--style auto 用），默认自动在 models/ 找",
     )
     parser.add_argument(
         "--parallel",
@@ -144,7 +152,7 @@ def main(argv: List[str]) -> int:
 
     percent_regions: List[ft.RelativeRegion] = []
     pixel_regions: List[ft.Region] = []
-    if args.mode == remover.HARD_MODE and args.style in ("blur", "delogo", ft.INPAINT_STYLE):
+    if args.mode == remover.HARD_MODE and args.style in ("blur", "delogo", ft.INPAINT_STYLE, ft.AUTO_STYLE):
         for text in args.region_percent or []:
             parts = [float(x) for x in text.split(",")]
             if len(parts) != 4:
@@ -159,7 +167,8 @@ def main(argv: List[str]) -> int:
             except ValueError as exc:
                 print(f"--region 格式有误：{exc}", file=sys.stderr)
                 return 2
-        if not percent_regions and not pixel_regions:
+        # auto 模式区域是可选的（不给就是整幅画面找字）
+        if not percent_regions and not pixel_regions and args.style != ft.AUTO_STYLE:
             print(
                 f"{args.style} 模式需要用 --region 或 --region-percent 指定区域",
                 file=sys.stderr,
@@ -197,7 +206,7 @@ def main(argv: List[str]) -> int:
 
         region = None
         regions_px: List[ft.Region] = []
-        if args.mode == remover.HARD_MODE and args.style in ("blur", "delogo", ft.INPAINT_STYLE):
+        if args.mode == remover.HARD_MODE and args.style in ("blur", "delogo", ft.INPAINT_STYLE, ft.AUTO_STYLE):
             for relative_region in percent_regions:
                 regions_px.append(relative_region.to_pixels(info.width, info.height))
             regions_px.extend(pixel_regions)
@@ -233,6 +242,7 @@ def main(argv: List[str]) -> int:
                     model_path=args.model,
                     device=args.device,
                     workers=args.parallel,
+                    det_model_path=args.det_model,
                     on_progress=on_progress,
                     on_log=on_log,
                 )
