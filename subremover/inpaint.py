@@ -39,6 +39,18 @@ FEATHER_PX = 3
 MASK_DILATE_PX = 4
 THIN_BAND_MAX_H = 120   # 高度不超过这个值的区域整条一次推理，避免分块接缝
 
+# ---- 像素级笔画修复（动态字幕默认走的路线）-------------------------------- #
+# 只重绘「和周围背景不一样」的像素：文字笔画、描边、字下面的影子；背景的折线、
+# 纹理一律不动。但只修笔画时洞里没有背景可参考，模型会瞎补，所以把修复块上下
+# 各扩一块画面当上下文，让它照着旁边的结构把洞补出来。
+STROKE_BLUR_DIV = 4       # 背景估计的模糊半径 = 字高的四分之一（窗口太大会把字本身当背景）
+STROKE_HIGH = 60          # 强响应：笔画本体
+STROKE_LOW = 22           # 弱响应：描边和字的影子（只在强响应附近才保留）
+STROKE_GROW = 9           # 弱响应允许的离笔画距离
+STROKE_DILATE = 3         # 最终掩码再外扩，吃掉抗锯齿边缘
+STROKE_CTX_Y = 1.2        # 修复块上下各扩 1.2 倍字高当上下文
+STROKE_CTX_X = 56         # 左右各扩 56 像素
+STROKE_TILE_W = 440       # 横向切块宽度：块 + 两侧上下文 ≈ 512，像素 1:1 进模型
 # 长视频默认开两路并行推理（200 帧实测 1.15 → 1.48 帧/秒）；短于这个帧数
 # 要多加载一次模型，反而变慢
 PARALLEL_WORKERS = 2
@@ -247,20 +259,22 @@ def plan_tiles(
     height: int,
     tile: int = 440,
     margin: int = 36,
+    mask_fn: Optional[Callable[[ft.Region, Tuple[int, int, int, int]], object]] = None,
 ) -> List[Tuple[ft.Region, Tuple[int, int, int, int], "np.ndarray", "np.ndarray"]]:
     """把修复区域拆成若干块，每块连同上下文都不超过模型 512 的输入。
 
     返回 [(画面内裁剪框, 镜像补边量, 掩码, 羽化 alpha)]。拆块是为了让原始像素
     1:1 参与推理——整条字幕带缩到 512 会把细节抹平。
+
+    mask_fn 给了就用它返回的**像素级掩码**（只盖住文字笔画和描边），块内其余
+    画面不重绘；没给或者那块里一个像素都没有时，退回整块矩形掩码兜底。
     """
     np = _load_numpy()
     region = region.clamped(width, height)
     jobs = []
-    # 窄而长的字幕带不分块：一条 1280×60 的带子横向切成 3 块时，相邻块的填充色
-    # 会有细微差异，拼起来就是一条竖缝。窄带纵向缩放本来就不敏感，整条一次推理
-    # 更干净。
-    if region.h <= THIN_BAND_MAX_H:
-        tile = max(tile, width)
+    # 整条 1280 宽的字幕带不要一次塞进 512：横向要缩到 0.4 倍，笔画直接被抹平，
+    # 修完就是一块糊糊的色带。按 440 宽切块，每块 440+2×36 正好对得上模型的 512
+    # 输入宽度，原始像素 1:1 参与推理；块间留 36 像素上下文 + 羽化，竖缝看不出来。
     for core_y in range(region.y, region.y + region.h, tile):
         core_h = min(tile, region.y + region.h - core_y)
         for core_x in range(region.x, region.x + region.w, tile):
@@ -282,9 +296,16 @@ def plan_tiles(
 
             pad_h, pad_w = box.h + pad[0] + pad[2], box.w + pad[1] + pad[3]
             mask = np.zeros((pad_h, pad_w), dtype=np.uint8)
-            top = pad[0] + (core.y - box.y)
-            left = pad[1] + (core.x - box.x)
-            mask[top : top + core.h, left : left + core.w] = 1
+            if mask_fn is not None:
+                stroke = mask_fn(box, pad)
+                if stroke is not None:
+                    stroke = np.asarray(stroke, dtype=np.uint8)
+                    if stroke.shape == mask.shape and int(stroke.sum()) > 0:
+                        mask = stroke
+            if int(mask.sum()) == 0:
+                top = pad[0] + (core.y - box.y)
+                left = pad[1] + (core.x - box.x)
+                mask[top : top + core.h, left : left + core.w] = 1
             # 字的抗锯齿边缘、描边外侧还有几个像素的过渡，掩码往外吃一圈再进模型，
             # 否则修完会剩下一圈淡淡的字影
             mask = dilate_mask(mask, MASK_DILATE_PX)
@@ -292,6 +313,212 @@ def plan_tiles(
                 continue
             jobs.append((box, pad, mask, feather_alpha(mask)))
     return jobs
+
+
+def box_blur(array, radius: int):
+    """积分图实现的盒式模糊（边缘按边缘像素延拓），用来估计「周围背景」。"""
+    np = _load_numpy()
+    radius = int(radius)
+    padded = np.pad(array.astype(np.float64), ((radius + 1, radius), (radius + 1, radius)), mode="edge")
+    cum = padded.cumsum(0).cumsum(1)
+    cum = np.pad(cum, ((1, 0), (1, 0)))
+    k = 2 * radius + 1
+    h, w = array.shape
+    total = cum[k : k + h, k : k + w] - cum[0:h, k : k + w] - cum[k : k + h, 0:w] + cum[0:h, 0:w]
+    return (total / float(k * k)).astype(np.float32)
+
+
+class FrameStrokeMask:
+    """从整帧亮度算「文字像素」：和周围背景差异大的那些点。
+
+    亮度先做大半径模糊当背景估计，再和原亮度相减：白色字、黑描边、字下的影子
+    都会冒出很大的差值，而背景本身是一条条平滑渐变，差值接近 0。
+    """
+
+    def __init__(self, frame) -> None:
+        np = _load_numpy()
+        self._np = np
+        self.lum = frame.astype(np.float32) @ np.array([0.299, 0.587, 0.114], dtype=np.float32)
+        self._blurred = {}
+
+    def _background(self, radius: int):
+        if radius not in self._blurred:
+            self._blurred[radius] = box_blur(self.lum, radius)
+        return self._blurred[radius]
+
+    def strokes(self, region: ft.Region):
+        """返回 region 大小的 0/1 笔画掩码（含描边和影子）。"""
+        np = self._np
+        region = region.clamped(self.lum.shape[1], self.lum.shape[0])
+        radius = max(8, int(region.h / STROKE_BLUR_DIV))
+        background = self._background(radius)
+        diff = np.abs(
+            self.lum[region.y : region.y + region.h, region.x : region.x + region.w]
+            - background[region.y : region.y + region.h, region.x : region.x + region.w]
+        )
+        strong = (diff > STROKE_HIGH).astype(np.uint8)
+        weak = (diff > STROKE_LOW).astype(np.uint8)
+        # 强响应直接算字；弱响应只在笔画附近才要，顺手把描边和字的影子带进来。
+        # 注意强响应必须并进来：笔画粗的地方「内部」和周围背景差异反而不大，
+        # 只留弱响应会在字中间留出一个个字形空洞，修完就是一串残字。
+        near = dilate_mask(strong, STROKE_GROW)
+        mask = (strong | (weak & near)).astype(np.uint8)
+        if int(mask.sum()) == 0:
+            return mask
+        return dilate_mask(mask, STROKE_DILATE)
+
+
+def _dump_jobs(frame, jobs, index: int) -> None:
+    """调试：把这一帧的修复块与掩码存成 png（临时用，环境变量开启）。"""
+    try:
+        np = _load_numpy()
+        out_dir = os.environ.get("SUBTITLE_REMOVER_DUMP_DIR", os.getcwd())
+        overlay = frame.copy()
+        for box, pad, mask, _alpha in jobs:
+            x0, y0 = box.x - pad[1], box.y - pad[0]
+            h, w = mask.shape
+            x0c, y0c = max(0, x0), max(0, y0)
+            hh = min(overlay.shape[0] - y0c, h - (y0c - y0))
+            ww = min(overlay.shape[1] - x0c, w - (x0c - x0))
+            if hh <= 0 or ww <= 0:
+                continue
+            m = mask[y0c - y0 : y0c - y0 + hh, x0c - x0 : x0c - x0 + ww]
+            sub = overlay[y0c : y0c + hh, x0c : x0c + ww]
+            sub[m > 0] = (255, 0, 0)
+            overlay[y0c : y0c + hh, x0c : x0c + ww] = sub
+        np.save(os.path.join(out_dir, f"jobs_{index}.npy"),
+                np.array([[b.x, b.y, b.w, b.h, int(m.sum())] for b, _p, m, _a in jobs]))
+        _write_png(overlay, os.path.join(out_dir, f"jobs_{index}.png"))
+    except Exception as exc:  # pragma: no cover - 调试用
+        print("dump 失败", exc)
+
+
+def _write_png(array, path: str) -> None:
+    np = _load_numpy()
+    import struct
+    import zlib
+
+    height, width = array.shape[:2]
+    raw = b"".join(b"\x00" + array[y].tobytes() for y in range(height))
+
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(data))
+            + tag
+            + data
+            + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+        )
+
+    png = (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+        + chunk(b"IDAT", zlib.compress(raw, 6))
+        + chunk(b"IEND", b"")
+    )
+    with open(path, "wb") as handle:
+        handle.write(png)
+
+
+def plan_stroke_tiles(region: ft.Region, strokes, width: int, height: int) -> List[Tuple]:
+    """把一个检测框拆成「带上下文的修复块」，掩码只盖住笔画像素。
+
+    和 plan_tiles 的区别：块比检测框大得多（上下各扩 STROKE_CTX_Y 倍字高），
+    这样模型能看到字幕带上下的真实结构；掩码仍然只标笔画，其余像素原样保留。
+    """
+    np = _load_numpy()
+    region = region.clamped(width, height)
+    ctx_y = max(12, int(round(region.h * STROKE_CTX_Y)))
+    ctx_x = STROKE_CTX_X
+    if strokes is None:
+        strokes = None
+    else:
+        strokes = np.asarray(strokes, dtype=np.uint8)
+        if int(strokes.sum()) == 0:
+            # 背景太平、找不到笔画：退回整框重绘，至少保证字去掉
+            strokes = np.ones((region.h, region.w), dtype=np.uint8)
+        elif strokes.shape != (region.h, region.w):
+            return []
+    if strokes is None:
+        strokes = np.ones((region.h, region.w), dtype=np.uint8)
+
+    want = ft.Region(region.x - ctx_x, region.y - ctx_y, region.w + 2 * ctx_x, region.h + 2 * ctx_y)
+    x0, y0 = max(0, want.x), max(0, want.y)
+    x1 = min(width, want.x + want.w)
+    y1 = min(height, want.y + want.h)
+    box = ft.Region(x0, y0, x1 - x0, y1 - y0)
+    if box.w <= 0 or box.h <= 0:
+        return []
+    pad = (
+        max(0, y0 - want.y),
+        max(0, x0 - want.x),
+        max(0, want.y + want.h - y1),
+        max(0, want.x + want.w - x1),
+    )
+    mask = np.zeros((box.h + pad[0] + pad[2], box.w + pad[1] + pad[3]), dtype=np.uint8)
+    dst_y = pad[0] + (region.y - box.y)
+    dst_x = pad[1] + (region.x - box.x)
+    mask[dst_y : dst_y + region.h, dst_x : dst_x + region.w] = strokes
+    # 再整体外扩一圈：检测框偶尔差一两个像素，字的上下缘会漏在框外，
+    # 这一圈让掩码能吃进上下文里，把漏出去的字缘一起修掉
+    mask = dilate_mask(mask, STROKE_DILATE)
+    if int(mask.sum()) == 0:
+        return []
+    return [(box, pad, mask, feather_alpha(mask))]
+
+
+class StrokeMask:
+    """检测得到的低分辨率笔画掩码 → 任意修复块上的像素级掩码。
+
+    每个输出像素映射到检测尺度上最近的格子，并做 2×2 取或：即使缩放比小于 1，
+    一两个像素宽的笔画也不会被采样漏掉。
+    """
+
+    def __init__(self, mask_low, net_w: int, net_h: int, width: int, height: int) -> None:
+        np = _load_numpy()
+        self._np = np
+        self.mask = np.asarray(mask_low, dtype=np.uint8)
+        self.net_w = max(1, int(net_w))
+        self.net_h = max(1, int(net_h))
+        self.scale_x = self.net_w / float(max(1, width))
+        self.scale_y = self.net_h / float(max(1, height))
+
+    def patch(self, box: ft.Region, pad: Tuple[int, int, int, int]):
+        """取出裁剪框（含镜像补边区）对应的掩码，形状与补边后的块一致。"""
+        np = self._np
+        out_h = box.h + pad[0] + pad[2]
+        out_w = box.w + pad[1] + pad[3]
+        ys = (np.arange(out_h, dtype=np.float32) + (box.y - pad[0])) * self.scale_y
+        xs = (np.arange(out_w, dtype=np.float32) + (box.x - pad[1])) * self.scale_x
+        iy = np.clip(np.floor(ys).astype(np.int32), 0, self.net_h - 1)
+        ix = np.clip(np.floor(xs).astype(np.int32), 0, self.net_w - 1)
+        iy1 = np.minimum(iy + 1, self.net_h - 1)
+        ix1 = np.minimum(ix + 1, self.net_w - 1)
+        grown = self.mask[iy][:, ix] | self.mask[iy1][:, ix] | self.mask[iy][:, ix1] | self.mask[iy1][:, ix1]
+        return grown.astype(np.uint8)
+
+
+def scope_mask_fn(field: StrokeMask, boxes: Sequence[ft.Region]) -> Callable:
+    """把笔画掩码限制在检测框内：框外零星的噪点像素不重绘。"""
+    np = _load_numpy()
+
+    def mask_fn(box: ft.Region, pad: Tuple[int, int, int, int]):
+        stroke = field.patch(box, pad)
+        if int(stroke.sum()) == 0:
+            return stroke
+        allow = np.zeros_like(stroke)
+        x0, y0 = box.x - pad[1], box.y - pad[0]
+        out_h, out_w = stroke.shape
+        for region in boxes:
+            ax0 = max(region.x, x0)
+            ax1 = min(region.x + region.w, x0 + out_w)
+            ay0 = max(region.y, y0)
+            ay1 = min(region.y + region.h, y0 + out_h)
+            if ax1 > ax0 and ay1 > ay0:
+                allow[ay0 - y0 : ay1 - y0, ax0 - x0 : ax1 - x0] = 1
+        return (stroke & allow).astype(np.uint8)
+
+    return mask_fn
+
 
 
 def dilate_mask(mask_01, radius: int):
@@ -544,12 +771,16 @@ def process_video(
     detect_scope: Optional[Sequence[ft.Region]] = None,
     det_model_path: Optional[str] = None,
     det_device: Optional[str] = None,
+    refine: int = -1,
 ) -> ft.RunResult:
     """逐帧修复画面中的文字区域，再重新编码成视频。
 
     detect=True 时不使用固定区域：每帧先跑一次文字检测，字在哪里就修哪里
     （滚动字幕、逐句换位、弹幕式跳动的文字都靠这个）。此时 detect_scope
     只作为"搜索范围"，可以为空表示整幅画面都找。
+
+    refine：修完自检轮数。修完一帧再检测一遍，还有字影就补修，-1 表示
+    动态模式默认开 1 轮（静态区域模式不需要）。
     """
     np = _load_numpy()
     width, height = info.width, info.height
@@ -724,6 +955,11 @@ def process_video(
     encode_ok = True
     text_frames = 0
     text_boxes = 0
+    stats = {"refine": 0}
+    if refine < 0:
+        refine = 1 if detect else 0
+    if detect and refine:
+        log(f"修复后自检：开启（最多补修 {int(refine)} 轮）")
 
     def tiles_for(boxes: Sequence[ft.Region]) -> list:
         jobs = []
@@ -735,8 +971,18 @@ def process_video(
         """这一帧要修哪些块：固定区域模式直接复用，动态模式每帧现算。"""
         if static_jobs is not None:
             return static_jobs
-        boxes = detector.detect(frame, scope) if detector is not None else []
-        return tiles_for(boxes)
+        if detector is None:
+            return []
+        boxes = detector.detect(frame, scope)
+        if not boxes:
+            return []
+        field = FrameStrokeMask(frame)
+        jobs = []
+        for region in boxes:
+            jobs.extend(plan_stroke_tiles(region, field.strokes(region), width, height))
+        if os.environ.get("SUBTITLE_REMOVER_DUMP") and processed >= int(os.environ["SUBTITLE_REMOVER_DUMP"]):
+            _dump_jobs(frame, jobs, processed)
+        return jobs
 
     def apply_jobs(frame, session, jobs: Sequence) -> None:
         for box, pad, mask, alpha in jobs:
@@ -755,12 +1001,53 @@ def process_video(
             blended = blended[pad[0] : pad[0] + box.h, pad[1] : pad[1] + box.w]
             frame[box.y : box.y + box.h, box.x : box.x + box.w] = blended
 
+    def process_frame(frame, jobs: Sequence, session) -> None:
+        """修完这一帧，再自检一遍：还有字影就就地补修（最多 refine 轮）。"""
+        apply_jobs(frame, session, jobs)
+        if not detect or detector is None or refine <= 0:
+            return
+
+        def overlap_area(a: ft.Region, b: ft.Region) -> int:
+            dx = min(a.x + a.w, b.x + b.w) - max(a.x, b.x)
+            dy = min(a.y + a.h, b.y + b.h) - max(a.y, b.y)
+            return dx * dy if dx > 0 and dy > 0 else 0
+
+        covered = [
+            ft.Region(
+                b.x + pad[1],
+                b.y + pad[0],
+                max(1, b.w - pad[1] - pad[3]),
+                max(1, b.h - pad[0] - pad[2]),
+            )
+            for b, pad, _m, _a in jobs
+        ]
+        for _ in range(int(refine)):
+            boxes = detector.detect(frame, scope)
+            if not boxes:
+                return
+            # 补修只补「第一遍没盖住的地方」：和已修框重叠超过一半就跳过，
+            # 避免同一块地方被反复重绘、越修越糊
+            fresh = [
+                region
+                for region in boxes
+                if max((overlap_area(region, old) for old in covered), default=0)
+                < region.w * region.h * 0.5
+            ]
+            if not fresh:
+                return
+            extra = tiles_for(fresh)
+            if not extra:
+                return
+            apply_jobs(frame, session, extra)
+            stats["refine"] += len(extra)
+            covered.extend(fresh)
+
     def frame_job(frame, jobs: Sequence):
         if not jobs:
             return frame
         session = session_pool.get()
         try:
-            apply_jobs(frame, session, jobs)
+            process_frame(frame, jobs, session)
         finally:
             session_pool.put(session)
         return frame
@@ -798,7 +1085,7 @@ def process_video(
                     text_boxes += len(jobs)
 
             if executor is None:
-                apply_jobs(frame, inpainter, jobs)
+                process_frame(frame, jobs, inpainter)
                 encoder.stdin.write(frame.tobytes())
                 processed += 1
                 now = time.time()
@@ -871,6 +1158,8 @@ def process_video(
     log(f"完成：{processed} 帧，用时 {seconds:.1f}s（{processed / seconds:.2f} 帧/秒）")
     if detect:
         log(f"逐帧检测：{text_frames} 帧检出文字，共修复 {text_boxes} 块；其余帧原样保留")
+        if stats["refine"]:
+            log(f"修复后自检：又补修 {stats['refine']} 块残留字影")
     if on_progress:
         on_progress(1.0, info.duration)
     return ft.RunResult(returncode=0, cancelled=False, seconds=seconds, log_tail="")
