@@ -40,6 +40,11 @@ MIN_AREA = 40          # 太小的连通域（噪点）直接丢
 MIN_BOX_SIDE = 8       # 单边小于 8px 的框多半是噪点或一个笔画
 MAX_BOXES = 16         # 一帧最多修这么多块，避免满屏文字把片子拖成几小时
 
+# 像素级掩码用的阈值：比文字框阈值低，把笔画、描边、半透明边缘都包进来。
+# 掩码只覆盖这些像素（而不是整个矩形），模型就只重写文字本身，
+# 周围的画面一个像素都不动——去完字幕看起来就是原图。
+MASK_THRESH = 0.12
+
 # 检测框外扩：字幕的描边、发光、投影往往比字形本身大一圈。
 # DB 检测出的框只包住字形"核心"（44px 的字，框高常常只有 21px），所以纵向要
 # 给得比横向大得多，否则黑描边和字的上下缘会留在掩码外面，修完还剩一圈字影。
@@ -197,6 +202,13 @@ def expand_box(box: Tuple[int, int, int, int], width: int, height: int) -> ft.Re
     return ft.Region(x - pad_x, y - pad_y, w + 2 * pad_x, h + 2 * pad_y).clamped(width, height)
 
 
+def prob_to_mask(prob, thresh: float = MASK_THRESH):
+    """概率图 → 0/1 像素掩码（包住笔画、描边和半透明边缘，但不碰周围画面）。"""
+    np = _load_numpy()
+    array = np.asarray(prob, dtype=np.float32)
+    return (array > float(thresh)).astype(np.uint8)
+
+
 def rect_overlap_ratio(a: ft.Region, b: ft.Region) -> float:
     x0 = max(a.x, b.x)
     y0 = max(a.y, b.y)
@@ -317,12 +329,8 @@ class TextDetector:
         self.load_seconds = time.time() - started
 
     # ---------------------------------------------------------------- 推理
-    def detect(
-        self,
-        frame_rgb,
-        scope: Optional[Sequence[ft.Region]] = None,
-    ) -> List[ft.Region]:
-        """返回该帧要重绘的区域（已外扩、已合并、按面积截断）。"""
+    def _prob_map(self, frame_rgb):
+        """跑一次 DB 网络，返回 (概率图, net_w, net_h)。"""
         np = self._np
         height, width = frame_rgb.shape[:2]
         net_h, net_w = resize_to_limit(height, width)
@@ -339,6 +347,21 @@ class TextDetector:
             prob = prob[0]
         if prob.shape != (net_h, net_w):
             prob = _bilinear(prob, net_h, net_w)
+        return prob, net_w, net_h
+
+    def detect_detail(
+        self,
+        frame_rgb,
+        scope: Optional[Sequence[ft.Region]] = None,
+    ):
+        """返回 (要重绘的区域列表, 低分辨率笔画掩码, net_w, net_h)。
+
+        掩码是像素级的：只有字（含描边）那些像素被标出来，矩形框只是它的外包。
+        重绘时按掩码下笔，框内的背景保持原样。
+        """
+        height, width = frame_rgb.shape[:2]
+        prob, net_w, net_h = self._prob_map(frame_rgb)
+        mask = prob_to_mask(prob)
 
         boxes = boxes_from_prob(prob)
         scale_x = width / float(net_w)
@@ -357,4 +380,13 @@ class TextDetector:
                     height,
                 )
             )
-        return limit_boxes(merge_boxes(regions), scope)
+        return limit_boxes(merge_boxes(regions), scope), mask, net_w, net_h
+
+    def detect(
+        self,
+        frame_rgb,
+        scope: Optional[Sequence[ft.Region]] = None,
+    ) -> List[ft.Region]:
+        """返回该帧要重绘的区域（已外扩、已合并、按面积截断）。"""
+        regions, _mask, _w, _h = self.detect_detail(frame_rgb, scope)
+        return regions
