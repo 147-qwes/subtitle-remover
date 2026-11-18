@@ -376,18 +376,31 @@ class InpaintLogicTests(unittest.TestCase):
         except Exception:
             self.skipTest("numpy 未安装")
         np = __import__("numpy")
-        region = ft.Region(0, 620, 1280, 90)
-        tiles = inpaint.plan_tiles(region, 1280, 720)
+        region = ft.Region(0, 300, 1280, 240)
+        tiles = inpaint.plan_tiles(region, 1280, 600)
         self.assertGreaterEqual(len(tiles), 2)
-        covered = np.zeros((720, 1280), dtype=np.uint8)
+        covered = np.zeros((600, 1280), dtype=np.uint8)
         for box, pad, mask, _alpha in tiles:
             self.assertLessEqual(mask.shape[0] + 0, 512)
             self.assertLessEqual(mask.shape[1] + 0, 512)
             covered[box.y : box.y + box.h, box.x : box.x + box.w] = 1
-        # 拆分后整条字幕带都要被覆盖到
-        self.assertEqual(int(covered[620:710, :].min()), 1)
+        # 拆分后整块区域都要被覆盖到
+        self.assertEqual(int(covered[300:540, :].min()), 1)
 
-    def test_plan_tiles_mask_is_only_own_core(self) -> None:
+    def test_thin_band_is_single_tile(self) -> None:
+        from subremover import inpaint
+
+        # 窄而长的字幕带整条一次推理：分块会在拼接处留下可见竖缝
+        tiles = inpaint.plan_tiles(ft.Region(0, 620, 1280, 60), 1280, 720)
+        self.assertEqual(len(tiles), 1)
+        box, pad, mask, _alpha = tiles[0]
+        self.assertEqual(box.y, 584)
+        self.assertGreaterEqual(box.w, 1279)
+        # 掩码整条覆盖，尺寸超过 512 由 inpaint_patch 缩放
+        self.assertGreaterEqual(mask.shape[1], 1280)
+        self.assertEqual(int(mask[box.h // 2, 1280 // 2]), 1)
+
+    def test_dilate_mask_grows_outward(self) -> None:
         from subremover import inpaint
 
         try:
@@ -395,10 +408,30 @@ class InpaintLogicTests(unittest.TestCase):
         except Exception:
             self.skipTest("numpy 未安装")
         np = __import__("numpy")
-        tiles = inpaint.plan_tiles(ft.Region(0, 620, 1280, 90), 1280, 720)
+        mask = np.zeros((40, 60), dtype=np.uint8)
+        mask[15:25, 20:40] = 1
+        grown = inpaint.dilate_mask(mask, 3)
+        self.assertEqual(grown.shape, mask.shape)
+        self.assertGreater(int(grown.sum()), int(mask.sum()))
+        # 原掩码全保留，且只向外扩 3px
+        self.assertEqual(int(grown[18, 30]), 1)
+        self.assertEqual(int(grown[15 - 2, 30]), 1)
+        self.assertEqual(int(grown[15 - 5, 30]), 0)
+        self.assertEqual(int(grown[0, 0]), 0)
+
+    def test_plan_tiles_mask_covers_own_core(self) -> None:
+        from subremover import inpaint
+
+        try:
+            import numpy as np  # noqa: F401
+        except Exception:
+            self.skipTest("numpy 未安装")
+        np = __import__("numpy")
+        tiles = inpaint.plan_tiles(ft.Region(0, 300, 1280, 240), 1280, 600)
         total = sum(int(mask.sum()) for _b, _p, mask, _a in tiles)
-        # 每个块只负责自己那一格，合计等于区域像素数
-        self.assertEqual(total, 1280 * 90)
+        # 每块负责自己的那一格，掩码再向外膨胀一圈（吃掉描边和抗锯齿边缘）
+        self.assertGreaterEqual(total, 1280 * 240)
+        self.assertLess(total, 1280 * 240 + 24 * (1280 + 240) * 4)
 
     def test_provider_candidates_fallback_to_cpu(self) -> None:
         from subremover import inpaint
@@ -445,9 +478,110 @@ class InpaintLogicTests(unittest.TestCase):
             inpaint.process_video = original
 
         self.assertEqual(len(captured["regions"]), 2)
-        self.assertEqual([(r.x, r.y, r.w, r.h) for r in captured["regions"]],
-                         [(0, 620, 1280, 90), (0, 0, 360, 64)])
+        self.assertEqual(
+            [(r.x, r.y, r.w, r.h) for r in captured["regions"]],
+            [(0, 620, 1280, 90), (0, 0, 360, 64)],
+        )
 
+
+class TextDetectTests(unittest.TestCase):
+    """动态字幕检测的纯几何逻辑（不需要检测模型）。"""
+
+    def setUp(self) -> None:
+        try:
+            import numpy as np  # noqa: F401
+        except Exception:
+            self.skipTest("numpy 未安装")
+
+    def test_boxes_from_prob_keeps_text_blob(self) -> None:
+        import numpy as np
+
+        from subremover import textdet
+
+        prob = np.zeros((64, 128), dtype=np.float32)
+        prob[20:40, 10:110] = 0.9
+        boxes = textdet.boxes_from_prob(prob)
+        self.assertTrue(boxes)
+        x, y, w, h = max(boxes, key=lambda b: b[2] * b[3])
+        self.assertGreaterEqual(w, 100)
+        self.assertGreaterEqual(h, 20)
+
+    def test_boxes_from_prob_drops_tiny_specks(self) -> None:
+        import numpy as np
+
+        from subremover import textdet
+
+        prob = np.zeros((64, 128), dtype=np.float32)
+        prob[30:33, 30:33] = 0.9  # 3×3 噪点，小于 MIN_AREA
+        self.assertEqual(textdet.boxes_from_prob(prob), [])
+
+    def test_expand_box_covers_glyph_edges(self) -> None:
+        """DB 框只包字形核心，纵向要额外吃掉描边和上下缘。"""
+        from subremover import textdet
+
+        box = textdet.expand_box((200, 500, 600, 24), 1280, 720)
+        pad_y = max(textdet.EXPAND_MIN_Y, int(24 * textdet.EXPAND_RATIO_Y))
+        self.assertEqual(box.y, 500 - pad_y)
+        self.assertEqual(box.h, 24 + 2 * pad_y)
+        # 窄高框（竖排字 / 角标）纵向吃到 70%
+        tall = textdet.expand_box((100, 100, 30, 60), 1280, 720)
+        self.assertEqual(tall.h, 60 + 2 * int(60 * textdet.EXPAND_RATIO_Y))
+
+    def test_expand_box_stays_inside_frame(self) -> None:
+        from subremover import textdet
+
+        box = textdet.expand_box((0, 0, 300, 20), 1280, 720)
+        self.assertGreaterEqual(box.x, 0)
+        self.assertGreaterEqual(box.y, 0)
+        self.assertLessEqual(box.x + box.w, 1280)
+        self.assertLessEqual(box.y + box.h, 720)
+
+    def test_merge_boxes_joins_same_line_pieces(self) -> None:
+        from subremover import textdet
+
+        regions = [ft.Region(0, 600, 200, 40), ft.Region(203, 600, 200, 40)]
+        merged = textdet.merge_boxes(regions)
+        self.assertEqual(len(merged), 1)
+        self.assertGreaterEqual(merged[0].w, 400)
+
+    def test_merge_boxes_keeps_different_lines(self) -> None:
+        from subremover import textdet
+
+        regions = [ft.Region(0, 600, 200, 40), ft.Region(0, 500, 200, 40)]
+        self.assertEqual(len(textdet.merge_boxes(regions)), 2)
+
+    def test_limit_boxes_filters_by_scope(self) -> None:
+        from subremover import textdet
+
+        regions = [ft.Region(100, 600, 400, 40), ft.Region(900, 20, 300, 30)]
+        kept = textdet.limit_boxes(regions, scope=[ft.Region(0, 560, 1280, 160)])
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(kept[0].y, 600)
+
+    def test_limit_boxes_caps_count(self) -> None:
+        from subremover import textdet
+
+        regions = [ft.Region(0, i * 20, 100, 18) for i in range(40)]
+        kept = textdet.limit_boxes(regions)
+        self.assertLessEqual(len(kept), textdet.MAX_BOXES)
+
+    def test_det_model_size_is_checked(self) -> None:
+        import os
+        import tempfile
+
+        from subremover import textdet
+
+        # 截断的下载文件不能当成可用模型
+        with tempfile.NamedTemporaryFile("wb", suffix=".onnx", delete=False) as handle:
+            handle.write(b"\0" * 1024)
+            path = handle.name
+        try:
+            import unittest.mock as mock
+
+            with mock.patch.dict(os.environ, {textdet.DET_ENV: path}):
+                self.assertIsNone(textdet.find_det_model())
+        finally:
+            os.remove(path)
 
 
 if __name__ == "__main__":
