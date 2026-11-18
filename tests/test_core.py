@@ -387,18 +387,20 @@ class InpaintLogicTests(unittest.TestCase):
         # 拆分后整块区域都要被覆盖到
         self.assertEqual(int(covered[300:540, :].min()), 1)
 
-    def test_thin_band_is_single_tile(self) -> None:
+    def test_thin_band_is_split_for_1to1_detail(self) -> None:
         from subremover import inpaint
 
-        # 窄而长的字幕带整条一次推理：分块会在拼接处留下可见竖缝
+        # 1280×60 的字幕带要切块：整条塞进 512 会横向缩到 0.4 倍，笔画糊成色带。
+        # 目标：每块的「核心+上下文」横向不超过 512，原始像素 1:1 进模型。
         tiles = inpaint.plan_tiles(ft.Region(0, 620, 1280, 60), 1280, 720)
-        self.assertEqual(len(tiles), 1)
-        box, pad, mask, _alpha = tiles[0]
-        self.assertEqual(box.y, 584)
-        self.assertGreaterEqual(box.w, 1279)
-        # 掩码整条覆盖，尺寸超过 512 由 inpaint_patch 缩放
-        self.assertGreaterEqual(mask.shape[1], 1280)
-        self.assertEqual(int(mask[box.h // 2, 1280 // 2]), 1)
+        self.assertGreaterEqual(len(tiles), 2)
+        for box, pad, mask, _alpha in tiles:
+            self.assertLessEqual(box.w + pad[1] + pad[3], 512)
+            self.assertEqual(mask.shape[1], box.w + pad[1] + pad[3])
+        covered = 0
+        for _box, _pad, mask, _alpha in tiles:
+            covered += int(mask.sum())
+        self.assertGreaterEqual(covered, 1280 * 60)
 
     def test_dilate_mask_grows_outward(self) -> None:
         from subremover import inpaint
@@ -582,6 +584,107 @@ class TextDetectTests(unittest.TestCase):
                 self.assertIsNone(textdet.find_det_model())
         finally:
             os.remove(path)
+
+
+class StrokeMaskTests(unittest.TestCase):
+    """像素级掩码：只修笔画，框内其他地方保持原样。"""
+
+    def setUp(self) -> None:
+        try:
+            import numpy as np  # noqa: F401
+        except Exception:
+            self.skipTest("numpy 未安装")
+
+    def test_prob_to_mask_keeps_halo_and_drops_background(self) -> None:
+        import numpy as np
+
+        from subremover import textdet
+
+        prob = np.zeros((64, 128), dtype=np.float32)
+        prob[10:20, 10:40] = 0.35     # 笔画本体
+        prob[10:20, 40:60] = 0.05     # 淡淡的背景响应，不该被修
+        mask = textdet.prob_to_mask(prob)
+        self.assertEqual(int(mask[10:20, 10:40].sum()), 10 * 30)
+        self.assertEqual(int(mask[10:20, 40:60].sum()), 0)
+        self.assertEqual(int(mask.sum()), 10 * 30)
+
+    def test_stroke_mask_keeps_one_pixel_stroke(self) -> None:
+        """检测尺度比原图小的时候，1px 宽的笔画也不能被采样漏掉。"""
+        import numpy as np
+
+        from subremover import inpaint
+
+        mask_low = np.zeros((34, 60), dtype=np.uint8)
+        mask_low[:, 30] = 1
+        field = inpaint.StrokeMask(mask_low, 60, 34, 660, 340)
+        patch = field.patch(ft.Region(300, 100, 200, 100), (0, 0, 0, 0))
+        self.assertEqual(patch.shape, (100, 200))
+        self.assertGreater(int(patch.sum()), 0)
+        cols = np.nonzero(patch.any(axis=0))[0]
+        # 竖线落在块内 x≈330 处：低分辨率一格对应原图约 11px，加上 2×2 取样，
+        # 只占这两格左右，不会糊成整块
+        self.assertLess(int(cols.max() - cols.min()), 26)
+        self.assertLess(int(patch.sum()), 100 * 26)
+
+    def test_scope_mask_fn_drops_pixels_outside_boxes(self) -> None:
+        import numpy as np
+
+        from subremover import inpaint
+
+        mask_low = np.zeros((34, 60), dtype=np.uint8)
+        mask_low[10:14, 20:40] = 1
+        field = inpaint.StrokeMask(mask_low, 60, 34, 1200, 680)
+        boxes = [ft.Region(380, 180, 420, 100)]
+        mask_fn = inpaint.scope_mask_fn(field, boxes)
+        patch = mask_fn(ft.Region(300, 100, 600, 300), (0, 0, 0, 0))
+        self.assertEqual(patch.shape, (300, 600))
+        # 框外（y<180）那部分必须被清掉
+        self.assertEqual(int(patch[0:60].sum()), 0)
+        self.assertGreater(int(patch.sum()), 0)
+
+    def test_plan_tiles_uses_stroke_mask(self) -> None:
+        import numpy as np
+
+        from subremover import inpaint
+
+        region = ft.Region(0, 600, 400, 80)
+        stroke = np.zeros((152, 472), dtype=np.uint8)
+        stroke[40:70, 100:200] = 1
+
+        def mask_fn(_box, _pad):
+            return stroke
+
+        tiles = inpaint.plan_tiles(region, 1280, 720, mask_fn=mask_fn)
+        self.assertEqual(len(tiles), 1)
+        _box, _pad, mask, _alpha = tiles[0]
+        rect = 400 * 80
+        # 只比笔画本身多出膨胀那几圈，远小于整块矩形
+        self.assertGreater(int(mask.sum()), int(stroke.sum()))
+        self.assertLess(int(mask.sum()), rect // 2)
+
+    def test_plan_tiles_falls_back_to_rect_when_mask_empty(self) -> None:
+        import numpy as np
+
+        from subremover import inpaint
+
+        def mask_fn(_box, _pad):
+            return np.zeros((152, 472), dtype=np.uint8)
+
+        region = ft.Region(0, 600, 400, 80)
+        tiles = inpaint.plan_tiles(region, 1280, 720, mask_fn=mask_fn)
+        self.assertEqual(len(tiles), 1)
+        _box, _pad, mask, _alpha = tiles[0]
+        self.assertGreaterEqual(int(mask.sum()), 400 * 80)
+
+    def test_cli_full_frame_flag(self) -> None:
+        from subremover import cli
+
+        args = cli.build_parser().parse_args(["--style", "auto", "--full-frame"])
+        self.assertTrue(args.full_frame)
+        self.assertFalse(args.refine)
+        self.assertTrue(
+            cli.build_parser().parse_args(["--style", "auto", "--refine"]).refine
+        )
 
 
 if __name__ == "__main__":
