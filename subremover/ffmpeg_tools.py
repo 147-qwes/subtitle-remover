@@ -31,7 +31,10 @@ HARD_STYLES = ("crop_bottom", "crop_top", "blur", "delogo")
 
 # AI 修复（不是 ffmpeg 滤镜，由 inpaint.py 逐帧重绘）
 INPAINT_STYLE = "inpaint"
-ALL_STYLES = HARD_STYLES + (INPAINT_STYLE,)
+
+# 逐帧自动检测文字再重绘（动态字幕 / 滚动字幕；框选区域只当"搜索范围"）
+AUTO_STYLE = "auto"
+ALL_STYLES = HARD_STYLES + (INPAINT_STYLE, AUTO_STYLE)
 
 
 class FFmpegNotFound(RuntimeError):
