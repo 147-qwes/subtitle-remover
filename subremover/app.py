@@ -16,7 +16,7 @@ from tkinter import filedialog, messagebox, ttk
 from typing import Dict, List, Optional
 
 from . import ffmpeg_tools as ft
-from . import inpaint, remover
+from . import inpaint, remover, textdet
 from .constants import DEVICE_LABELS, STYLE_BY_KEY, STYLE_LABELS, VIDEO_EXTS, VIDEO_FILETYPES
 from .dnd import AVAILABLE as DND_AVAILABLE
 from .dnd import TkinterDnD
@@ -48,8 +48,10 @@ class SubtitleRemoverApp(UiMixin, _BaseWindow):
         self._on_mode_change()
         self._on_style_change()
 
-        # 装了 AI 修复模型时，默认就用"重绘"方式（不留遮挡）
-        if inpaint.find_model_path():
+        # 模型齐全时默认用"自动检测"（动态字幕也能去干净），只有 LaMa 时用固定区域重绘
+        if inpaint.find_model_path() and textdet.find_det_model():
+            self.style_var.set(STYLE_BY_KEY.get("auto", self.style_var.get()))
+        elif inpaint.find_model_path():
             self.style_var.set(STYLE_BY_KEY.get("inpaint", self.style_var.get()))
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -203,7 +205,9 @@ class SubtitleRemoverApp(UiMixin, _BaseWindow):
             widget.configure(state=region_state)
         for widget in getattr(self, "device_widgets", []):
             if isinstance(widget, ttk.Combobox):
-                widget.configure(state="readonly" if style == "inpaint" else "disabled")
+                widget.configure(
+                    state="readonly" if style in ("inpaint", "auto") else "disabled"
+                )
 
     def _apply_preset(self, y_ratio: float, w_ratio: float, h_ratio: float) -> None:
         self.region_vars["x"].set("0")
@@ -354,9 +358,9 @@ class SubtitleRemoverApp(UiMixin, _BaseWindow):
         config["region"] = None
         config["regions"] = []
 
-        if style in ("blur", "delogo", "inpaint"):
+        if style in ("blur", "delogo", "inpaint", "auto"):
             items = list(self._region_items)
-            if not items:
+            if not items and style != "auto":
                 try:
                     items = [self._current_region_values()]
                 except ValueError:
@@ -373,7 +377,7 @@ class SubtitleRemoverApp(UiMixin, _BaseWindow):
                     raise ValueError("字幕区域超出了画面范围（X+宽、Y+高 不能超过 100%）")
                 regions.append(ft.RelativeRegion(x / 100.0, y / 100.0, w / 100.0, h / 100.0))
             config["regions"] = regions
-            config["region"] = regions[0]
+            config["region"] = regions[0] if regions else None
         return config
 
     # ------------------------------------------------------------------ 执行
@@ -619,6 +623,13 @@ class SubtitleRemoverApp(UiMixin, _BaseWindow):
             self._append_log(
                 "AI 修复未就绪：运行 python tools\\download_model.py 下载模型后，可做到去字不留遮挡"
             )
+        det = textdet.find_det_model()
+        if det:
+            self._append_log(f"文字检测模型：{det}（动态字幕用）")
+        else:
+            self._append_log(
+                "动态字幕未就绪：运行 python tools\\download_model.py --det 下载检测模型（4.5 MB）"
+            )
 
     def _show_ffmpeg_info(self) -> None:
         ft.clear_binary_cache()
@@ -661,7 +672,9 @@ class SubtitleRemoverApp(UiMixin, _BaseWindow):
             "   · 软字幕轨移除：视频内的字幕流（mkv 内封、mp4 的 mov_text 等），\n"
             "     -c copy 无损移除，几秒完成。\n"
             "   · 硬字幕 / 水印去除：文字已经烧进画面。\n"
-            "     - AI 修复：按四周画面重绘文字区域，去字不留遮挡，人物场景依旧清晰（推荐，较慢）；\n"
+            "     - 自动检测字幕：每帧自动找字再重绘，字幕滚动/换位也能去干净（推荐）；\n"
+            "       可以在「待修复区域」里框几块当搜索范围，不框就是整幅画面找；\n"
+            "     - AI 修复：只重绘你框住的固定区域，去字不留遮挡，人物场景依旧清晰；\n"
             "     - 裁切：直接切掉底部/顶部一条，画面变矮，最快最好；\n"
             "     - 模糊：字幕位置打模糊，会留下模糊带；\n"
             "     - delogo：按周围像素插值，背景复杂时会糊。\n"
@@ -677,7 +690,7 @@ class SubtitleRemoverApp(UiMixin, _BaseWindow):
         messagebox.showinfo(
             "关于",
             "视频去字幕工具 1.0\n\n"
-            "软字幕轨无损移除 + 硬字幕裁切/模糊/delogo 修复\n"
+            "软字幕轨无损移除 + 硬字幕逐帧检测/AI 重绘/裁切/模糊/delogo\n"
             "基于 Python + tkinter + ffmpeg，完全本地处理，不上传视频。",
             parent=self,
         )
