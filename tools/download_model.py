@@ -1,7 +1,9 @@
-"""下载 AI 修复模型（LaMa fp32 ONNX，约 208 MB）。
+"""下载 AI 修复模型（LaMa fp32 ONNX，约 208 MB）与文字检测模型（约 4.5 MB）。
 
 用法：
-    python tools/download_model.py            # 下到 models/lama_fp32.onnx
+    python tools/download_model.py            # 下 LaMa 到 models/lama_fp32.onnx
+    python tools/download_model.py --det      # 下文字检测模型到 models/ppocr_v4_det.onnx
+    python tools/download_model.py --all      # 两个都下
     python tools/download_model.py --mirror   # 用国内镜像源
 
 支持断点续传：网络中断后重新执行会从断点继续。
@@ -28,6 +30,17 @@ MIRROR_SOURCES = [
     "https://github.com/neureps/carousel-fit-models/releases/download/lama-v1/lama-fp32-1faef5301d78.onnx",
 ]
 
+# 文字检测（PaddleOCR PP-OCRv4 DB 检测的 ONNX 导出，Apache-2.0）
+DET_FILENAME = "ppocr_v4_det.onnx"
+DET_MODEL_SIZE = 4745517
+DET_MODEL_SHA256 = "d2a7720d45a54257208b1e13e36a8479894cb74155a5efe29462512d42f49da9"
+DET_SOURCES = [
+    "https://huggingface.co/SWHL/RapidOCR/resolve/main/PP-OCRv4/ch_PP-OCRv4_det_infer.onnx",
+]
+DET_MIRROR_SOURCES = [
+    "https://hf-mirror.com/SWHL/RapidOCR/resolve/main/PP-OCRv4/ch_PP-OCRv4_det_infer.onnx",
+] + DET_SOURCES
+
 
 def project_root() -> str:
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -48,10 +61,10 @@ def sha256_of(path: str) -> str:
     return digest.hexdigest()
 
 
-def download(url: str, target: str) -> bool:
+def download(url: str, target: str, total: int = MODEL_SIZE) -> bool:
     """带断点续传的下载；返回是否完整拿到文件。"""
     existing = file_size(target)
-    if existing >= MODEL_SIZE:
+    if existing >= total:
         return True
 
     request = urllib.request.Request(url, headers={"User-Agent": "subtitle-remover/1.0"})
@@ -64,7 +77,6 @@ def download(url: str, target: str) -> bool:
             if existing and response.status != 206:
                 existing = 0  # 服务端不支持续传，从头来
             mode = "ab" if existing else "wb"
-            total = MODEL_SIZE
             done = existing
             last_report = 0.0
             with open(target, mode) as handle:
@@ -89,47 +101,72 @@ def download(url: str, target: str) -> bool:
         return False
 
     print()
-    return file_size(target) >= MODEL_SIZE
+    return file_size(target) >= total
 
 
-def main(argv=None) -> int:
-    parser = argparse.ArgumentParser(description="下载 LaMa 修复模型")
-    parser.add_argument("--mirror", action="store_true", help="使用镜像源（国内网络）")
-    parser.add_argument("--out", default=None, help="输出路径（默认 models/lama_fp32.onnx）")
-    parser.add_argument("--sha", action="store_true", help="下载后校验 SHA256（较慢）")
-    args = parser.parse_args(argv)
-
-    target = os.path.abspath(args.out or os.path.join(project_root(), "models", FILENAME))
+def fetch(name: str, filename: str, size: int, sha: str, sources, mirrors, out=None) -> int:
+    """下载单个模型，返回 0 表示成功。"""
+    target = os.path.abspath(out or os.path.join(project_root(), "models", filename))
     os.makedirs(os.path.dirname(target), exist_ok=True)
-    sources = MIRROR_SOURCES if args.mirror else SOURCES
 
-    if file_size(target) >= MODEL_SIZE:
-        print(f"模型已存在：{target}")
+    if file_size(target) >= size:
+        print(f"{name}已存在：{target}")
         return 0
 
     for url in sources:
         for attempt in range(1, 4):
             print(f"[{attempt}/3] {url}")
-            if download(url, target):
+            if download(url, target, size):
                 break
-        if file_size(target) >= MODEL_SIZE:
+        if file_size(target) >= size:
             break
 
-    if file_size(target) < MODEL_SIZE:
-        print(f"下载未完成（{file_size(target) / 1024 / 1024:.1f} MB），请重试或手动下载：")
-        for url in MIRROR_SOURCES:
+    if file_size(target) < size:
+        print(f"{name}下载未完成（{file_size(target) / 1024 / 1024:.1f} MB），请重试或手动下载：")
+        for url in mirrors:
             print(f"  {url}")
         return 1
 
     print(f"完成：{target}（{file_size(target) / 1024 / 1024:.1f} MB）")
-    if args.sha:
-        print("校验 SHA256 …")
-        actual = sha256_of(target)
-        if actual != MODEL_SHA256:
-            print(f"校验失败：{actual}\n期望：{MODEL_SHA256}")
-            return 1
-        print("SHA256 正确")
+    actual = sha256_of(target)
+    if actual != sha:
+        print(f"校验失败：{actual}\n期望：{sha}")
+        return 1
+    print("SHA256 正确")
     return 0
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description="下载 AI 修复与文字检测模型")
+    parser.add_argument("--mirror", action="store_true", help="使用镜像源（国内网络）")
+    parser.add_argument("--out", default=None, help="输出路径（默认 models/ 下）")
+    parser.add_argument("--det", action="store_true", help="只下文字检测模型（约 4.5 MB）")
+    parser.add_argument("--all", action="store_true", help="两个模型都下")
+    parser.add_argument("--sha", action="store_true", help="兼容旧参数，下载始终会校验")
+    args = parser.parse_args(argv)
+
+    code = 0
+    if not args.det:
+        code |= fetch(
+            "AI 修复模型",
+            FILENAME,
+            MODEL_SIZE,
+            MODEL_SHA256,
+            MIRROR_SOURCES if args.mirror else SOURCES,
+            MIRROR_SOURCES,
+            args.out,
+        )
+    if args.det or args.all:
+        code |= fetch(
+            "文字检测模型",
+            DET_FILENAME,
+            DET_MODEL_SIZE,
+            DET_MODEL_SHA256,
+            DET_MIRROR_SOURCES if args.mirror else DET_SOURCES,
+            DET_MIRROR_SOURCES,
+            args.out,
+        )
+    return code
 
 
 if __name__ == "__main__":
