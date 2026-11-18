@@ -36,6 +36,8 @@ NET_SIZE = 512
 
 ALIGN = 8
 FEATHER_PX = 3
+MASK_DILATE_PX = 4
+THIN_BAND_MAX_H = 120   # 高度不超过这个值的区域整条一次推理，避免分块接缝
 
 # 长视频默认开两路并行推理（200 帧实测 1.15 → 1.48 帧/秒）；短于这个帧数
 # 要多加载一次模型，反而变慢
@@ -254,6 +256,11 @@ def plan_tiles(
     np = _load_numpy()
     region = region.clamped(width, height)
     jobs = []
+    # 窄而长的字幕带不分块：一条 1280×60 的带子横向切成 3 块时，相邻块的填充色
+    # 会有细微差异，拼起来就是一条竖缝。窄带纵向缩放本来就不敏感，整条一次推理
+    # 更干净。
+    if region.h <= THIN_BAND_MAX_H:
+        tile = max(tile, width)
     for core_y in range(region.y, region.y + region.h, tile):
         core_h = min(tile, region.y + region.h - core_y)
         for core_x in range(region.x, region.x + region.w, tile):
@@ -278,10 +285,32 @@ def plan_tiles(
             top = pad[0] + (core.y - box.y)
             left = pad[1] + (core.x - box.x)
             mask[top : top + core.h, left : left + core.w] = 1
+            # 字的抗锯齿边缘、描边外侧还有几个像素的过渡，掩码往外吃一圈再进模型，
+            # 否则修完会剩下一圈淡淡的字影
+            mask = dilate_mask(mask, MASK_DILATE_PX)
             if int(mask.sum()) == 0:
                 continue
             jobs.append((box, pad, mask, feather_alpha(mask)))
     return jobs
+
+
+def dilate_mask(mask_01, radius: int):
+    """把 0/1 掩码向外膨胀 radius 像素（可分离最大值滤波，不依赖 OpenCV）。"""
+    np = _load_numpy()
+    if radius <= 0:
+        return np.asarray(mask_01, dtype=np.uint8)
+    current = (np.asarray(mask_01) > 0).astype(np.int32)
+    kernel = radius * 2 + 1
+    for axis in (0, 1):
+        pad_width = [(0, 0), (0, 0)]
+        pad_width[axis] = (radius + 1, radius)
+        padded = np.pad(current, pad_width, mode="constant")
+        cum = np.cumsum(padded, axis=axis)
+        if axis == 0:
+            current = cum[kernel:, :] - cum[:-kernel, :]
+        else:
+            current = cum[:, kernel:] - cum[:, :-kernel]
+    return (current > 0).astype(np.uint8)
 
 
 def pad_to_multiple(value: int, align: int = ALIGN) -> int:
@@ -511,13 +540,22 @@ def process_video(
     model_path: Optional[str] = None,
     device: str = "auto",
     workers: int = 0,
+    detect: bool = False,
+    detect_scope: Optional[Sequence[ft.Region]] = None,
+    det_model_path: Optional[str] = None,
+    det_device: Optional[str] = None,
 ) -> ft.RunResult:
-    """逐帧修复画面中的文字区域，再重新编码成视频。"""
+    """逐帧修复画面中的文字区域，再重新编码成视频。
+
+    detect=True 时不使用固定区域：每帧先跑一次文字检测，字在哪里就修哪里
+    （滚动字幕、逐句换位、弹幕式跳动的文字都靠这个）。此时 detect_scope
+    只作为"搜索范围"，可以为空表示整幅画面都找。
+    """
     np = _load_numpy()
     width, height = info.width, info.height
     if not (width and height):
         raise ValueError("该文件没有可识别的视频画面")
-    if not regions:
+    if not detect and not regions:
         raise ValueError("AI 修复需要至少一个文字区域")
 
     ffmpeg, _ffprobe = ft.require_binaries()
@@ -539,17 +577,34 @@ def process_video(
     if inpainter.fallback_note:
         log(inpainter.fallback_note)
 
-    # 预计算每个区域的修复块：区域大就拆块，保证每块原始像素 1:1 进模型
-    jobs = []
-    for region in actual_regions:
-        tiles = plan_tiles(region, width, height)
-        log(
-            f"修复区域：x={region.x} y={region.y} w={region.w} h={region.h}"
-            f"（拆成 {len(tiles)} 块）"
+    # 预计算每个区域的修复块（固定区域模式）：区域大就拆块，保证每块原始像素 1:1 进模型
+    static_jobs = None
+    detector = None
+    if not detect:
+        jobs = []
+        for region in actual_regions:
+            tiles = plan_tiles(region, width, height)
+            log(
+                f"修复区域：x={region.x} y={region.y} w={region.w} h={region.h}"
+                f"（拆成 {len(tiles)} 块）"
+            )
+            jobs.extend(tiles)
+        if not jobs:
+            raise ValueError("文字区域为空，请重新框选")
+        static_jobs = jobs
+    else:
+        from .textdet import TextDetector  # 只有动态模式才需要检测模型
+
+        detector = TextDetector(
+            model_path=det_model_path, device=det_device or device
         )
-        jobs.extend(tiles)
-    if not jobs:
-        raise ValueError("文字区域为空，请重新框选")
+        log(f"文字检测模型：{detector.model_path}（加载 {detector.load_seconds:.1f}s）")
+        log(f"检测后端：{', '.join(detector.providers)}")
+        scope = [r.clamped(width, height) for r in (detect_scope or [])]
+        if scope:
+            log(f"检测范围限定在 {len(scope)} 个框选区域以内")
+        else:
+            log("检测范围：整幅画面（每帧自动找字）")
 
     # 多路并行：CUDA 里部分算子会回退到 CPU（memcpy 停顿），两路各自持有一个
     # 会话可以把这些停顿叠起来吃掉；实测 720p 双区域约提升 30%。短片并行反而
@@ -667,8 +722,23 @@ def process_video(
     processed = 0
     last_emit = 0.0
     encode_ok = True
+    text_frames = 0
+    text_boxes = 0
 
-    def apply_jobs(frame, session) -> None:
+    def tiles_for(boxes: Sequence[ft.Region]) -> list:
+        jobs = []
+        for region in boxes:
+            jobs.extend(plan_tiles(region, width, height))
+        return jobs
+
+    def frame_jobs(frame) -> list:
+        """这一帧要修哪些块：固定区域模式直接复用，动态模式每帧现算。"""
+        if static_jobs is not None:
+            return static_jobs
+        boxes = detector.detect(frame, scope) if detector is not None else []
+        return tiles_for(boxes)
+
+    def apply_jobs(frame, session, jobs: Sequence) -> None:
         for box, pad, mask, alpha in jobs:
             patch = frame[box.y : box.y + box.h, box.x : box.x + box.w]
             if any(pad):
@@ -685,10 +755,12 @@ def process_video(
             blended = blended[pad[0] : pad[0] + box.h, pad[1] : pad[1] + box.w]
             frame[box.y : box.y + box.h, box.x : box.x + box.w] = blended
 
-    def frame_job(frame):
+    def frame_job(frame, jobs: Sequence):
+        if not jobs:
+            return frame
         session = session_pool.get()
         try:
-            apply_jobs(frame, session)
+            apply_jobs(frame, session, jobs)
         finally:
             session_pool.put(session)
         return frame
@@ -719,9 +791,14 @@ def process_video(
             if not buffer:
                 break
             frame = np.frombuffer(buffer, dtype=np.uint8).reshape(height, width, 3).copy()
+            jobs = frame_jobs(frame)
+            if detect:
+                if jobs:
+                    text_frames += 1
+                    text_boxes += len(jobs)
 
             if executor is None:
-                apply_jobs(frame, inpainter)
+                apply_jobs(frame, inpainter, jobs)
                 encoder.stdin.write(frame.tobytes())
                 processed += 1
                 now = time.time()
@@ -730,7 +807,7 @@ def process_video(
                     fraction = min(0.999, processed / total) if total else 0.0
                     on_progress(fraction, processed / fps if fps else 0.0)
             else:
-                pending.append(executor.submit(frame_job, frame))
+                pending.append(executor.submit(frame_job, frame, jobs))
                 while len(pending) > workers:
                     drain_one()
         if executor is not None and not cancelled:
@@ -792,6 +869,8 @@ def process_video(
         )
 
     log(f"完成：{processed} 帧，用时 {seconds:.1f}s（{processed / seconds:.2f} 帧/秒）")
+    if detect:
+        log(f"逐帧检测：{text_frames} 帧检出文字，共修复 {text_boxes} 块；其余帧原样保留")
     if on_progress:
         on_progress(1.0, info.duration)
     return ft.RunResult(returncode=0, cancelled=False, seconds=seconds, log_tail="")
