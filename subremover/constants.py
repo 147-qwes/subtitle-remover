@@ -30,12 +30,12 @@ VIDEO_EXTS = {
 }
 
 STYLE_LABELS: Dict[str, str] = {
-    "自动检测字幕（动态字幕：逐帧找字再修复，不留遮挡）": "auto",
+    "全屏去除字幕（逐帧找字 + 像素级修复，动态字幕推荐）": "auto",
     "裁切底部（切掉底部字幕条）": "crop_bottom",
     "裁切顶部（切掉顶部字幕条）": "crop_top",
     "模糊遮罩（画面尺寸不变）": "blur",
     "delogo 修复（按周围像素插值）": "delogo",
-    "AI 修复（固定区域重绘，不留遮挡）": "inpaint",
+    "AI 修复（框选固定区域重绘，不留遮挡）": "inpaint",
 }
 STYLE_KEYS = list(STYLE_LABELS.keys())
 STYLE_BY_KEY = {value: label for label, value in STYLE_LABELS.items()}
