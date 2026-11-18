@@ -227,6 +227,25 @@ class UiMixin:
 
         self.region_widgets.append(self.region_list_box)
 
+        # 全屏扫描 / 自检补修：整幅画面找字，一个框都不用框
+        scan_row = ttk.Frame(self.hard_frame)
+        scan_row.grid(row=4, column=0, columnspan=6, sticky="w", pady=(8, 0))
+        self.full_scan_var = tk.BooleanVar(value=True)
+        self.full_scan_check = ttk.Checkbutton(
+            scan_row,
+            text="全屏扫描：整幅画面找字（不框选区域，字幕在哪都能去掉）",
+            variable=self.full_scan_var,
+            command=self._on_style_change,
+        )
+        self.full_scan_check.pack(side="left")
+        self.refine_var = tk.BooleanVar(value=False)
+        self.refine_check = ttk.Checkbutton(
+            scan_row,
+            text="修完自检：还有淡字影就自动补修（慢约 30%）",
+            variable=self.refine_var,
+        )
+        self.refine_check.pack(side="left", padx=(18, 0))
+
         # 编码行
         ttk.Label(self.hard_frame, text="编码器 / 预设").grid(
             row=2, column=0, sticky="w", pady=(10, 0)
@@ -258,12 +277,12 @@ class UiMixin:
         ).pack(side="left", padx=(12, 0))
         self.encoder_widgets = [self.encoder_combo, self.preset_combo, self.crf_spin]
 
-        # AI 推理设备（只有 AI 修复用得到）
+        # AI 推理设备（只有 AI 修复 / 全屏去除用得到）
         ttk.Label(self.hard_frame, text="AI 推理设备").grid(
-            row=3, column=0, sticky="w", pady=(8, 0)
+            row=5, column=0, sticky="w", pady=(8, 0)
         )
         device_row = ttk.Frame(self.hard_frame)
-        device_row.grid(row=3, column=1, columnspan=5, sticky="w", pady=(8, 0))
+        device_row.grid(row=5, column=1, columnspan=5, sticky="w", pady=(8, 0))
         self.device_var = tk.StringVar(value=DEVICE_KEYS[0])
         self.device_combo = ttk.Combobox(
             device_row,
@@ -350,7 +369,7 @@ class UiMixin:
 
         # 模式联动
         self.hard_widgets = (
-            [self.style_combo, self.ratio_spin]
+            [self.style_combo, self.ratio_spin, self.full_scan_check, self.refine_check]
             + self.region_widgets
             + self.encoder_widgets
             + self.device_widgets

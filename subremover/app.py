@@ -48,7 +48,7 @@ class SubtitleRemoverApp(UiMixin, _BaseWindow):
         self._on_mode_change()
         self._on_style_change()
 
-        # 模型齐全时默认用"自动检测"（动态字幕也能去干净），只有 LaMa 时用固定区域重绘
+        # 模型齐全时默认用"全屏去除字幕"（动态字幕也能去干净），只有 LaMa 时用固定区域重绘
         if inpaint.find_model_path() and textdet.find_det_model():
             self.style_var.set(STYLE_BY_KEY.get("auto", self.style_var.get()))
         elif inpaint.find_model_path():
@@ -200,7 +200,15 @@ class SubtitleRemoverApp(UiMixin, _BaseWindow):
         style = STYLE_LABELS.get(self.style_var.get(), "crop_bottom")
         crop_mode = style in ("crop_bottom", "crop_top")
         self.ratio_spin.configure(state="normal" if crop_mode else "disabled")
-        region_state = "disabled" if crop_mode else "normal"
+
+        # 全屏扫描只对「全屏去除字幕」有意义；勾上就整幅画面找字，区域控件全部失效
+        full_scan = style == "auto" and bool(self.full_scan_var.get())
+        self.full_scan_check.configure(state="normal" if style == "auto" else "disabled")
+        self.refine_check.configure(
+            state="normal" if style in ("inpaint", "auto") else "disabled"
+        )
+
+        region_state = "disabled" if (crop_mode or full_scan) else "normal"
         for widget in self.region_widgets:
             widget.configure(state=region_state)
         for widget in getattr(self, "device_widgets", []):
@@ -299,6 +307,15 @@ class SubtitleRemoverApp(UiMixin, _BaseWindow):
             self._append_log("该区域已在列表中")
             return
         self._region_items.append(item)
+        # 手动加了区域，说明用户想限定范围：自动关掉全屏扫描，让区域当搜索范围用
+        if (
+            STYLE_LABELS.get(self.style_var.get()) == "auto"
+            and getattr(self, "full_scan_var", None) is not None
+            and self.full_scan_var.get()
+        ):
+            self.full_scan_var.set(False)
+            self._on_style_change()
+            self._append_log("已关闭全屏扫描：区域将作为检测范围使用（清空列表可回到全屏）")
         self._refresh_region_list()
 
     def _refresh_region_list(self) -> None:
@@ -355,11 +372,14 @@ class SubtitleRemoverApp(UiMixin, _BaseWindow):
         config["preset"] = self.preset_var.get() or "medium"
         config["encoder"] = self.encoder_var.get() or "libx264"
         config["device"] = DEVICE_LABELS.get(self.device_var.get(), "auto")
+        config["refine"] = 1 if self.refine_var.get() else 0
         config["region"] = None
         config["regions"] = []
 
         if style in ("blur", "delogo", "inpaint", "auto"):
             items = list(self._region_items)
+            if style == "auto" and self.full_scan_var.get():
+                items = []  # 全屏扫描：整幅画面找字，不用框选
             if not items and style != "auto":
                 try:
                     items = [self._current_region_values()]
@@ -471,7 +491,10 @@ class SubtitleRemoverApp(UiMixin, _BaseWindow):
                                 f"w={item.w} h={item.h}",
                             )
                         )
-                self._events.put(("log", f"模式：硬字幕去除 / {config['style']}"))
+                if config["style"] == "auto" and not config.get("regions"):
+                    self._events.put(("log", "模式：硬字幕去除 / 全屏扫描（整幅画面逐帧找字）"))
+                else:
+                    self._events.put(("log", f"模式：硬字幕去除 / {config['style']}"))
             else:
                 self._events.put(("log", "模式：软字幕轨移除（-c copy）"))
 
@@ -497,6 +520,7 @@ class SubtitleRemoverApp(UiMixin, _BaseWindow):
                         preset=config.get("preset", "medium"),
                         encoder=config.get("encoder", "libx264"),
                         device=config.get("device", "auto"),
+                        refine=config.get("refine", 0),
                         on_progress=on_progress,
                         on_log=on_log,
                         cancel=self._cancel,
@@ -672,17 +696,20 @@ class SubtitleRemoverApp(UiMixin, _BaseWindow):
             "   · 软字幕轨移除：视频内的字幕流（mkv 内封、mp4 的 mov_text 等），\n"
             "     -c copy 无损移除，几秒完成。\n"
             "   · 硬字幕 / 水印去除：文字已经烧进画面。\n"
-            "     - 自动检测字幕：每帧自动找字再重绘，字幕滚动/换位也能去干净（推荐）；\n"
-            "       可以在「待修复区域」里框几块当搜索范围，不框就是整幅画面找；\n"
-            "     - AI 修复：只重绘你框住的固定区域，去字不留遮挡，人物场景依旧清晰；\n"
+            "     - 全屏去除字幕（推荐）：保持「全屏扫描」勾着，整幅画面逐帧找字，\n"
+            "       滚动字幕、逐句换位、字幕会动都能去；只重绘文字笔画那几个像素，\n"
+            "       画面主体和背景保持原样，被字压住的纹理能顺结构接回去；\n"
+            "     - AI 修复：只有字幕位置固定时用它，点「框选区域…」框住文字位置；\n"
             "     - 裁切：直接切掉底部/顶部一条，画面变矮，最快最好；\n"
             "     - 模糊：字幕位置打模糊，会留下模糊带；\n"
             "     - delogo：按周围像素插值，背景复杂时会糊。\n"
-            "3. 「待修复区域」列表可以加多块：角标水印一块、底部字幕一块，一次跑完。\n"
-            "   点「框选区域…」在真实画面上拖框最准；也可以填百分比后点「添加当前区域」。\n"
-            "4. 设置输出目录（留空 = 源文件同目录），点「开始处理」。\n\n"
-            "提示：字幕位置逐帧移动、或背景复杂的视频，模糊/delogo 会有痕迹；\n"
-            "裁切是最稳妥的硬字幕方案。"
+            "3. 全屏扫描时「待修复区域」不需要用；如果你想限定范围（比如只去底部字幕、\n"
+            "   别动画面里的招牌），框一块或加一块区域，程序会自动退出全屏扫描、\n"
+            "   把区域当搜索范围用。\n"
+            "4. 「修完自检」：勾上后每帧修完再检测一遍，有漏字就地补修（慢约 30%，默认关）。\n"
+            "5. 设置输出目录（留空 = 源文件同目录），点「开始处理」。\n\n"
+            "提示：全屏去除每帧都要检测 + 推理，显卡上大约 0.8-1.1 帧/秒；\n"
+            "字幕位置固定、又想要更快的，可以用「AI 修复」只修框住的那一块。"
         )
         messagebox.showinfo("使用说明", text, parent=self)
 
