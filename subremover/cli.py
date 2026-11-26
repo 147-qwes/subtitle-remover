@@ -118,7 +118,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--refine",
         action="store_true",
-        help="auto 模式修完自检一遍，有漏字就地补修（慢约 30%）",
+        help="auto 模式修完自检一遍，有漏字就地补修（慢约 30%%）",
     )
     parser.add_argument(
         "--no-refine",
