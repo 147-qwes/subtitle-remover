@@ -84,6 +84,7 @@ def remove_hard_subtitles(
     det_model_path: Optional[str] = None,
     det_device: Optional[str] = None,
     refine: int = -1,
+    protect: Optional[Iterable[ft.Region]] = None,
 ) -> ft.RunResult:
     """去除画面内烧录字幕 / 水印。
 
@@ -131,6 +132,7 @@ def remove_hard_subtitles(
             det_model_path=det_model_path,
             det_device=det_device,
             refine=refine,
+            protect=list(protect or []),
         )
 
     cmd = ft.build_hard_remove_command(
