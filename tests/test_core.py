@@ -676,6 +676,35 @@ class StrokeMaskTests(unittest.TestCase):
         _box, _pad, mask, _alpha = tiles[0]
         self.assertGreaterEqual(int(mask.sum()), 400 * 80)
 
+    def test_low_contrast_flat_background_is_detected(self) -> None:
+        """白卡片上的浅灰字：固定 60/22 会漏掉，平坦背景才允许压阈值。"""
+        import numpy as np
+
+        from subremover import inpaint
+
+        frame = np.full((120, 320, 3), 238, dtype=np.uint8)
+        for x in (60, 100, 140, 180, 220):   # 细笔画，模糊估计不会把字本身当成背景
+            frame[40:62, x : x + 4] = 222    # 浅灰字：和背景只差 16 级
+        region = ft.Region(20, 20, 280, 80)
+        mask = inpaint.FrameStrokeMask(frame).strokes(region)
+        self.assertGreater(int(mask.sum()), 0)
+        # 掩码只盖字附近，不能把整块背景都当成字
+        self.assertLess(int(mask.sum()), region.w * region.h)
+
+    def test_low_contrast_textured_background_is_left_alone(self) -> None:
+        """有纹理的背景即使反差低也不压阈值，免得把纹理当字重绘。"""
+        import numpy as np
+
+        from subremover import inpaint
+
+        # 平滑渐变背景（std 大，但不是噪点纹理）：固定阈值下不该出笔画掩码
+        ramp = np.linspace(100, 235, 280, dtype=np.float32)
+        frame = np.repeat(ramp[None, :, None], 120, axis=0).repeat(3, axis=2).astype(np.uint8)
+        frame = np.clip(frame.astype(np.int16) + 14, 0, 255).astype(np.uint8)
+        region = ft.Region(20, 20, 280, 80)
+        mask = inpaint.FrameStrokeMask(frame).strokes(region)
+        self.assertEqual(int(mask.sum()), 0)
+
     def test_cli_full_frame_flag(self) -> None:
         from subremover import cli
 
@@ -685,6 +714,42 @@ class StrokeMaskTests(unittest.TestCase):
         self.assertTrue(
             cli.build_parser().parse_args(["--style", "auto", "--refine"]).refine
         )
+
+
+class ProtectRegionTests(unittest.TestCase):
+    """保护区：框住的商品/贴纸文字不能被当成字幕擦掉。"""
+
+    def test_box_inside_protect_is_dropped(self) -> None:
+        from subremover import inpaint
+
+        boxes = [ft.Region(100, 600, 200, 40), ft.Region(800, 100, 120, 36)]
+        kept = inpaint.drop_protected(boxes, [ft.Region(60, 580, 300, 90)])
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(kept[0].x, 800)
+
+    def test_box_outside_protect_is_kept(self) -> None:
+        from subremover import inpaint
+
+        boxes = [ft.Region(100, 600, 200, 40)]
+        kept = inpaint.drop_protected(boxes, [ft.Region(700, 40, 200, 120)])
+        self.assertEqual(kept, boxes)
+
+    def test_partial_cover_below_ratio_is_kept(self) -> None:
+        from subremover import inpaint
+
+        # 只盖住一角的检测框仍然要擦：保护区边界画歪一点不该整块漏字
+        boxes = [ft.Region(0, 600, 200, 40)]
+        kept = inpaint.drop_protected(boxes, [ft.Region(0, 600, 40, 40)])
+        self.assertEqual(len(kept), 1)
+
+    def test_cli_protect_arguments(self) -> None:
+        from subremover import cli
+
+        args = cli.build_parser().parse_args(
+            ["--style", "auto", "--protect-percent", "5,80,30,15", "--protect", "100,700,200,60"]
+        )
+        self.assertEqual(args.protect_percent, ["5,80,30,15"])
+        self.assertEqual(args.protect, ["100,700,200,60"])
 
 
 if __name__ == "__main__":

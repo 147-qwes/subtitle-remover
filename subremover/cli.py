@@ -126,6 +126,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="旧参数，保留兼容：自检现在是默认关闭的",
     )
     parser.add_argument(
+        "--protect",
+        action="append",
+        default=None,
+        metavar="x,y,w,h",
+        help="保护区（像素坐标，可重复）：落在保护区里的文字不擦除，用来保住商品/贴纸文字",
+    )
+    parser.add_argument(
+        "--protect-percent",
+        action="append",
+        default=None,
+        metavar="x,y,w,h",
+        help="保护区（百分比，可重复），适配不同分辨率的批量视频",
+    )
+    parser.add_argument(
         "--parallel",
         type=int,
         default=0,
@@ -194,6 +208,23 @@ def main(argv: List[str]) -> int:
             percent_regions = []
             pixel_regions = []
 
+    protect_percent: List[ft.RelativeRegion] = []
+    protect_pixel: List[ft.Region] = []
+    for text in args.protect_percent or []:
+        parts = [float(x) for x in text.split(",")]
+        if len(parts) != 4:
+            print("--protect-percent 需要 4 个数字", file=sys.stderr)
+            return 2
+        protect_percent.append(
+            ft.RelativeRegion(parts[0] / 100, parts[1] / 100, parts[2] / 100, parts[3] / 100)
+        )
+    for text in args.protect or []:
+        try:
+            protect_pixel.append(ft.parse_region(text))
+        except ValueError as exc:
+            print(f"--protect 格式有误：{exc}", file=sys.stderr)
+            return 2
+
     keep_subs = (
         [int(x) for x in args.keep_subs.split(",") if x.strip().isdigit()]
         if args.keep_subs
@@ -232,6 +263,12 @@ def main(argv: List[str]) -> int:
             if regions_px:
                 region = regions_px[0]
 
+        protect_px: List[ft.Region] = []
+        if args.mode == remover.HARD_MODE and args.style == ft.AUTO_STYLE:
+            for relative_region in protect_percent:
+                protect_px.append(relative_region.to_pixels(info.width, info.height))
+            protect_px.extend(protect_pixel)
+
         last_line = {"pct": -10.0}
 
         def on_progress(fraction: float, seconds: float) -> None:
@@ -263,6 +300,7 @@ def main(argv: List[str]) -> int:
                     workers=args.parallel,
                     det_model_path=args.det_model,
                     refine=1 if args.refine else 0,
+                    protect=protect_px,
                     on_progress=on_progress,
                     on_log=on_log,
                 )

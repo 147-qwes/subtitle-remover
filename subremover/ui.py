@@ -225,6 +225,17 @@ class UiMixin:
         )
         ttk.Button(region_buttons, text="清空", command=self._clear_regions).pack(fill="x")
 
+        ttk.Button(region_buttons, text="保护区…", command=self._pick_protect).pack(
+            fill="x", pady=(8, 0)
+        )
+        self.protect_count_var = tk.StringVar(value="已保护 0 块")
+        ttk.Label(
+            region_buttons, textvariable=self.protect_count_var, foreground="#6b7480"
+        ).pack(fill="x")
+        ttk.Button(region_buttons, text="清空保护", command=self._clear_protect).pack(
+            fill="x", pady=(2, 0)
+        )
+
         self.region_widgets.append(self.region_list_box)
 
         # 全屏扫描 / 自检补修：整幅画面找字，一个框都不用框

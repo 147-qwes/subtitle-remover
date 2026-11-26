@@ -38,6 +38,7 @@ class SubtitleRemoverApp(UiMixin, _BaseWindow):
         self._order: List[str] = []
         self._next_id = 0
         self._region_items: List[tuple] = []
+        self._protect_items: List[tuple] = []   # 保护区（百分比）：里面的文字不擦除
         self._events: "queue.Queue[tuple]" = queue.Queue()
         self._cancel = threading.Event()
         self._running = False
@@ -277,6 +278,55 @@ class SubtitleRemoverApp(UiMixin, _BaseWindow):
             f"（{row.info.width}×{row.info.height}）"
         )
 
+    def _pick_protect(self) -> None:
+        rows = self._selected_rows() or [
+            self._rows[iid] for iid in self._order if self._rows[iid].info
+        ]
+        if not rows:
+            messagebox.showinfo("先添加视频", "请先添加一个视频文件再框选保护区。", parent=self)
+            return
+        row = rows[0]
+        if row.info is None:
+            messagebox.showinfo("还在读取", "文件信息还没读完，请稍等再试。", parent=self)
+            return
+        if not row.info.has_video_dimensions:
+            messagebox.showwarning("没有画面", "该文件没有可识别的视频画面。", parent=self)
+            return
+        region = pick_region(self, row.path, row.info, None)
+        if not region:
+            return
+        relative = ft.RelativeRegion.from_pixels(region, row.info.width, row.info.height)
+        self._append_protect(
+            relative.x * 100, relative.y * 100, relative.w * 100, relative.h * 100
+        )
+        self._append_log(
+            f"保护区已加入：x={region.x} y={region.y} w={region.w} h={region.h}"
+            f"（{row.info.width}×{row.info.height}，这块里的字不会被擦）"
+        )
+
+    def _append_protect(self, x: float, y: float, w: float, h: float) -> None:
+        if w <= 0 or h <= 0:
+            messagebox.showwarning("参数有误", "保护区的宽、高必须大于 0", parent=self)
+            return
+        if x < 0 or y < 0 or x + w > 100.5 or y + h > 100.5:
+            messagebox.showwarning("参数有误", "保护区超出画面范围", parent=self)
+            return
+        item = (round(x, 1), round(y, 1), round(w, 1), round(h, 1))
+        if item in self._protect_items:
+            self._append_log("该保护区已在列表中")
+            return
+        self._protect_items.append(item)
+        self._update_protect_label()
+
+    def _update_protect_label(self) -> None:
+        count = len(self._protect_items)
+        self.protect_count_var.set(f"已保护 {count} 块" if count else "已保护 0 块")
+
+    def _clear_protect(self) -> None:
+        self._protect_items.clear()
+        self._update_protect_label()
+        self._append_log("保护区已清空：整幅画面里的文字都会被擦掉")
+
     def _current_region_values(self) -> tuple:
         return (
             float(self.region_vars["x"].get()),
@@ -398,6 +448,10 @@ class SubtitleRemoverApp(UiMixin, _BaseWindow):
                 regions.append(ft.RelativeRegion(x / 100.0, y / 100.0, w / 100.0, h / 100.0))
             config["regions"] = regions
             config["region"] = regions[0] if regions else None
+            config["protect"] = [
+                ft.RelativeRegion(x / 100.0, y / 100.0, w / 100.0, h / 100.0)
+                for (x, y, w, h) in self._protect_items
+            ]
         return config
 
     # ------------------------------------------------------------------ 执行
@@ -473,7 +527,15 @@ class SubtitleRemoverApp(UiMixin, _BaseWindow):
             mode = config["mode"]
             region = None
             regions_px: List[ft.Region] = []
+            protect_px: List[ft.Region] = []
             if mode == remover.HARD_MODE:
+                if info.has_video_dimensions and config.get("protect"):
+                    protect_px = [
+                        r.to_pixels(info.width, info.height) for r in config["protect"]
+                    ]
+                    self._events.put(
+                        ("log", f"保护区 {len(protect_px)} 块：里面的文字不会被擦除")
+                    )
                 if config.get("regions"):
                     if not info.has_video_dimensions:
                         self._events.put(("status", row.iid, "无视频画面"))
@@ -521,6 +583,7 @@ class SubtitleRemoverApp(UiMixin, _BaseWindow):
                         encoder=config.get("encoder", "libx264"),
                         device=config.get("device", "auto"),
                         refine=config.get("refine", 0),
+                        protect=protect_px,
                         on_progress=on_progress,
                         on_log=on_log,
                         cancel=self._cancel,
